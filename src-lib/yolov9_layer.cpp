@@ -2,8 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cfloat>
+#include <vector>
 
+float yolov9_dfl_cross_entropy_delta(const float *logits, int reg_max, float target_distance, float scale, float *delta);
 
 namespace
 {
@@ -23,6 +24,44 @@ namespace
 	{
 		return l.inference_branch * l.n;
 	}
+
+	struct BranchPoint
+	{
+		int input_index = -1;
+		int scale_idx = 0;
+		int x = 0;
+		int y = 0;
+		int stride = 1;
+		float anchor_x = 0.0f;
+		float anchor_y = 0.0f;
+		Darknet::Box decoded_box = {};
+	};
+
+	struct GroundTruth
+	{
+		int class_id = -1;
+		Darknet::Box box = {};
+		float x1 = 0.0f;
+		float y1 = 0.0f;
+		float x2 = 0.0f;
+		float y2 = 0.0f;
+	};
+
+	struct AssignmentCandidate
+	{
+		int truth_idx = -1;
+		int point_idx = -1;
+		float metric = 0.0f;
+		float overlap = 0.0f;
+	};
+
+	struct Assignment
+	{
+		int truth_idx = -1;
+		float metric = 0.0f;
+		float overlap = 0.0f;
+		float target_score = 0.0f;
+	};
 
 	static inline void softmax_bins(const float * logits, const int reg_max, float * probs)
 	{
@@ -102,6 +141,23 @@ namespace
 		return best_class;
 	}
 
+	static inline float class_logit(const Darknet::Layer & from, const int b, const int x, const int y, const int class_id, const int reg_max)
+	{
+		const int channel = 4 * reg_max + class_id;
+		return from.output[yolov9_channel_index(from, b, channel, y, x)];
+	}
+
+	static inline float class_score(const Darknet::Layer & from, const int b, const int x, const int y, const int class_id, const int reg_max)
+	{
+		return sigmoid(class_logit(from, b, x, y, class_id, reg_max));
+	}
+
+	static inline float bce_with_logits(const float logit, const float target)
+	{
+		const float max_value = std::max(logit, 0.0f);
+		return max_value - logit * target + std::log1p(std::exp(-std::fabs(logit)));
+	}
+
 	static inline void add_class_delta(Darknet::Layer & from, const int b, const int x, const int y, const int class_id, const int classes, const int reg_max, const float target, const float scale)
 	{
 		if (class_id < 0 or class_id >= classes)
@@ -115,10 +171,10 @@ namespace
 		from.delta[index] += scale * (target - prediction);
 	}
 
-	static inline void add_dfl_delta(Darknet::Layer & from, const int b, const int x, const int y, const int side, const int reg_max, const float target_distance, const float scale)
+	static inline float add_dfl_delta(Darknet::Layer & from, const int b, const int x, const int y, const int side, const int reg_max, const float target_distance, const float scale)
 	{
 		float logits[64];
-		float probs[64];
+		float deltas[64];
 		if (reg_max <= 0 or reg_max > static_cast<int>(sizeof(logits) / sizeof(logits[0])))
 		{
 			darknet_fatal_error(DARKNET_LOC, "YOLOv9 reg_max=%d exceeds local DFL buffer", reg_max);
@@ -129,30 +185,15 @@ namespace
 			const int channel = side * reg_max + bin;
 			logits[bin] = from.output[yolov9_channel_index(from, b, channel, y, x)];
 		}
-		softmax_bins(logits, reg_max, probs);
-
-		const float clipped = std::max(0.0f, std::min(target_distance, static_cast<float>(reg_max) - 1.01f));
-		const int left_bin = static_cast<int>(std::floor(clipped));
-		const int right_bin = std::min(left_bin + 1, reg_max - 1);
-		const float right_weight = clipped - left_bin;
-		const float left_weight = 1.0f - right_weight;
+		const float loss = yolov9_dfl_cross_entropy_delta(logits, reg_max, target_distance, scale, deltas);
 
 		for (int bin = 0; bin < reg_max; ++bin)
 		{
-			float target = 0.0f;
-			if (bin == left_bin)
-			{
-				target += left_weight;
-			}
-			if (bin == right_bin)
-			{
-				target += right_weight;
-			}
-
 			const int channel = side * reg_max + bin;
 			const int index = yolov9_channel_index(from, b, channel, y, x);
-			from.delta[index] += scale * (target - probs[bin]);
+			from.delta[index] += deltas[bin];
 		}
+		return loss;
 	}
 
 	static void zero_input_deltas(const Darknet::Layer & l, Darknet::NetworkState state)
@@ -167,6 +208,316 @@ namespace
 		}
 	}
 
+	static std::vector<GroundTruth> load_truths_for_batch(const Darknet::Layer & l, const Darknet::NetworkState & state, const int b)
+	{
+		std::vector<GroundTruth> truths;
+		for (int t = 0; t < l.max_boxes; ++t)
+		{
+			const float * truth_ptr = state.truth + b * l.truths + t * l.truth_size;
+			const Darknet::Box box = float_to_box_stride(truth_ptr, 1);
+			if (box.x <= 0.0f)
+			{
+				break;
+			}
+
+			const int class_id = static_cast<int>(truth_ptr[4]);
+			if (class_id < 0 or class_id >= l.classes)
+			{
+				darknet_fatal_error(DARKNET_LOC, "invalid class ID #%d", class_id);
+			}
+
+			GroundTruth truth;
+			truth.class_id = class_id;
+			truth.box = box;
+			truth.x1 = (box.x - box.w * 0.5f) * state.net.w;
+			truth.y1 = (box.y - box.h * 0.5f) * state.net.h;
+			truth.x2 = (box.x + box.w * 0.5f) * state.net.w;
+			truth.y2 = (box.y + box.h * 0.5f) * state.net.h;
+			truths.push_back(truth);
+		}
+		return truths;
+	}
+
+	static std::vector<BranchPoint> collect_branch_points(const Darknet::Layer & l, Darknet::NetworkState state, const int branch, const int b)
+	{
+		std::vector<BranchPoint> points;
+		for (int scale_idx = 0; scale_idx < l.n; ++scale_idx)
+		{
+			const int input_slot = branch * l.n + scale_idx;
+			const int input_index = l.input_layers[input_slot];
+			const Darknet::Layer & from = state.net.layers[input_index];
+			points.reserve(points.size() + static_cast<std::size_t>(from.out_w) * static_cast<std::size_t>(from.out_h));
+			const int stride = std::max(1, l.strides[scale_idx]);
+			for (int y = 0; y < from.out_h; ++y)
+			{
+				for (int x = 0; x < from.out_w; ++x)
+				{
+					BranchPoint point;
+					point.input_index = input_index;
+					point.scale_idx = scale_idx;
+					point.x = x;
+					point.y = y;
+					point.stride = stride;
+					point.anchor_x = x + 0.5f;
+					point.anchor_y = y + 0.5f;
+					point.decoded_box = decode_prediction(from, b, x, y, stride, l.reg_max, state.net.w, state.net.h);
+					points.push_back(point);
+				}
+			}
+		}
+		return points;
+	}
+
+	static inline bool anchor_inside_truth(const BranchPoint & point, const GroundTruth & truth)
+	{
+		const float anchor_x = point.anchor_x * point.stride;
+		const float anchor_y = point.anchor_y * point.stride;
+		return anchor_x > truth.x1 and anchor_y > truth.y1 and anchor_x < truth.x2 and anchor_y < truth.y2;
+	}
+
+	static std::vector<Assignment> assign_branch_targets(
+		const Darknet::Layer & l,
+		Darknet::NetworkState state,
+		const std::vector<BranchPoint> & points,
+		const std::vector<GroundTruth> & truths,
+		const int b)
+	{
+		std::vector<Assignment> assignments(points.size());
+		if (points.empty() or truths.empty())
+		{
+			return assignments;
+		}
+
+		std::vector<std::vector<AssignmentCandidate>> topk_per_truth(truths.size());
+		const int topk = std::max(1, l.tal_topk);
+		for (std::size_t truth_idx = 0; truth_idx < truths.size(); ++truth_idx)
+		{
+			std::vector<AssignmentCandidate> candidates;
+			const GroundTruth & truth = truths[truth_idx];
+			for (std::size_t point_idx = 0; point_idx < points.size(); ++point_idx)
+			{
+				const BranchPoint & point = points[point_idx];
+				if (not anchor_inside_truth(point, truth))
+				{
+					continue;
+				}
+
+				const Darknet::Layer & from = state.net.layers[point.input_index];
+				const float score = class_score(from, b, point.x, point.y, truth.class_id, l.reg_max);
+				const float overlap = std::max(0.0f, box_iou_kind(point.decoded_box, truth.box, CIOU));
+				if (overlap <= 0.0f or score <= 0.0f)
+				{
+					continue;
+				}
+
+				const float metric = std::pow(score, l.tal_alpha) * std::pow(overlap, l.tal_beta);
+				if (metric <= 1.0e-12f or not std::isfinite(metric))
+				{
+					continue;
+				}
+				candidates.push_back(AssignmentCandidate{static_cast<int>(truth_idx), static_cast<int>(point_idx), metric, overlap});
+			}
+
+			if (candidates.empty())
+			{
+				continue;
+			}
+			std::sort(
+				candidates.begin(),
+				candidates.end(),
+				[](const AssignmentCandidate & lhs, const AssignmentCandidate & rhs)
+				{
+					return lhs.metric > rhs.metric;
+				});
+			if (static_cast<int>(candidates.size()) > topk)
+			{
+				candidates.resize(topk);
+			}
+			topk_per_truth[truth_idx] = candidates;
+		}
+
+		for (const auto & candidates : topk_per_truth)
+		{
+			for (const AssignmentCandidate & candidate : candidates)
+			{
+				Assignment & current = assignments[candidate.point_idx];
+				if (current.truth_idx < 0 or candidate.overlap > current.overlap)
+				{
+					current.truth_idx = candidate.truth_idx;
+					current.metric = candidate.metric;
+					current.overlap = candidate.overlap;
+				}
+			}
+		}
+
+		std::vector<float> max_metric_by_truth(truths.size(), 0.0f);
+		std::vector<float> max_overlap_by_truth(truths.size(), 0.0f);
+		for (const Assignment & assignment : assignments)
+		{
+			if (assignment.truth_idx < 0)
+			{
+				continue;
+			}
+			max_metric_by_truth[assignment.truth_idx] = std::max(max_metric_by_truth[assignment.truth_idx], assignment.metric);
+			max_overlap_by_truth[assignment.truth_idx] = std::max(max_overlap_by_truth[assignment.truth_idx], assignment.overlap);
+		}
+
+		for (Assignment & assignment : assignments)
+		{
+			if (assignment.truth_idx < 0)
+			{
+				continue;
+			}
+			const float max_metric = max_metric_by_truth[assignment.truth_idx];
+			const float max_overlap = max_overlap_by_truth[assignment.truth_idx];
+			if (max_metric <= 0.0f)
+			{
+				assignment.truth_idx = -1;
+				assignment.target_score = 0.0f;
+				continue;
+			}
+			assignment.target_score = std::min(1.0f, assignment.metric * max_overlap / (max_metric + 1.0e-9f));
+		}
+
+		return assignments;
+	}
+
+	static float box_loss_from_distances(
+		const BranchPoint & point,
+		const float distances[4],
+		const GroundTruth & truth,
+		const IOU_LOSS iou_loss,
+		const int netw,
+		const int neth)
+	{
+		const Darknet::Box pred = yolov9_dist2bbox(point.anchor_x, point.anchor_y, distances, static_cast<float>(point.stride), netw, neth);
+		const float overlap = box_iou_kind(pred, truth.box, iou_loss);
+		return 1.0f - overlap;
+	}
+
+	static float add_ciou_projection_delta(
+		Darknet::Layer & from,
+		const Darknet::Layer & l,
+		const BranchPoint & point,
+		const int b,
+		const GroundTruth & truth,
+		const float scale,
+		const int netw,
+		const int neth)
+	{
+		float distances[4];
+		get_dfl_distances(from, b, point.x, point.y, l.reg_max, distances);
+		const float base_loss = box_loss_from_distances(point, distances, truth, l.iou_loss, netw, neth);
+		const float eps = 0.05f;
+
+		for (int side = 0; side < 4; ++side)
+		{
+			float side_logits[64];
+			float side_probs[64];
+			if (l.reg_max <= 0 or l.reg_max > static_cast<int>(sizeof(side_logits) / sizeof(side_logits[0])))
+			{
+				darknet_fatal_error(DARKNET_LOC, "YOLOv9 reg_max=%d exceeds local DFL buffer", l.reg_max);
+			}
+			for (int bin = 0; bin < l.reg_max; ++bin)
+			{
+				const int channel = side * l.reg_max + bin;
+				side_logits[bin] = from.output[yolov9_channel_index(from, b, channel, point.y, point.x)];
+			}
+			softmax_bins(side_logits, l.reg_max, side_probs);
+
+			float plus_distances[4] = {distances[0], distances[1], distances[2], distances[3]};
+			float minus_distances[4] = {distances[0], distances[1], distances[2], distances[3]};
+			plus_distances[side] = std::min(static_cast<float>(l.reg_max) - 1.0f, distances[side] + eps);
+			minus_distances[side] = std::max(0.0f, distances[side] - eps);
+			const float actual_eps = plus_distances[side] - minus_distances[side];
+			if (actual_eps <= 0.0f)
+			{
+				continue;
+			}
+
+			const float loss_plus = box_loss_from_distances(point, plus_distances, truth, l.iou_loss, netw, neth);
+			const float loss_minus = box_loss_from_distances(point, minus_distances, truth, l.iou_loss, netw, neth);
+			const float dloss_ddistance = (loss_plus - loss_minus) / actual_eps;
+
+			for (int bin = 0; bin < l.reg_max; ++bin)
+			{
+				const float dproject_dlogit = side_probs[bin] * (static_cast<float>(bin) - distances[side]);
+				const int channel = side * l.reg_max + bin;
+				const int index = yolov9_channel_index(from, b, channel, point.y, point.x);
+				from.delta[index] += -scale * dloss_ddistance * dproject_dlogit;
+			}
+		}
+
+		return scale * base_loss;
+	}
+
+	static float train_yolov9_branch(Darknet::Layer & l, Darknet::NetworkState state, const int branch)
+	{
+		const float branch_weight = (branch == l.inference_branch) ? 1.0f : l.aux_loss_weight;
+		float branch_loss = 0.0f;
+
+		for (int b = 0; b < l.batch; ++b)
+		{
+			const std::vector<GroundTruth> truths = load_truths_for_batch(l, state, b);
+			const std::vector<BranchPoint> points = collect_branch_points(l, state, branch, b);
+			std::vector<Assignment> assignments = assign_branch_targets(l, state, points, truths, b);
+
+			float target_scores_sum = 0.0f;
+			for (const Assignment & assignment : assignments)
+			{
+				target_scores_sum += assignment.target_score;
+			}
+			target_scores_sum = std::max(1.0f, target_scores_sum);
+
+			const float cls_scale = branch_weight * l.cls_normalizer / target_scores_sum;
+			for (std::size_t point_idx = 0; point_idx < points.size(); ++point_idx)
+			{
+				const BranchPoint & point = points[point_idx];
+				Darknet::Layer & from = state.net.layers[point.input_index];
+				const Assignment & assignment = assignments[point_idx];
+				const int assigned_class = assignment.truth_idx >= 0 ? truths[assignment.truth_idx].class_id : -1;
+				for (int class_id = 0; class_id < l.classes; ++class_id)
+				{
+					const float target = class_id == assigned_class ? assignment.target_score : 0.0f;
+					const float logit = class_logit(from, b, point.x, point.y, class_id, l.reg_max);
+					branch_loss += cls_scale * bce_with_logits(logit, target);
+					add_class_delta(from, b, point.x, point.y, class_id, l.classes, l.reg_max, target, cls_scale);
+				}
+			}
+
+			for (std::size_t point_idx = 0; point_idx < points.size(); ++point_idx)
+			{
+				const Assignment & assignment = assignments[point_idx];
+				if (assignment.truth_idx < 0 or assignment.target_score <= 0.0f)
+				{
+					continue;
+				}
+
+				const BranchPoint & point = points[point_idx];
+				const GroundTruth & truth = truths[assignment.truth_idx];
+				Darknet::Layer & from = state.net.layers[point.input_index];
+				const float box_scale = branch_weight * l.box_normalizer * assignment.target_score / target_scores_sum;
+				const float dfl_scale = branch_weight * l.dfl_normalizer * assignment.target_score / target_scores_sum;
+
+				const float target_distances[4] =
+				{
+					point.anchor_x - truth.x1 / point.stride,
+					point.anchor_y - truth.y1 / point.stride,
+					truth.x2 / point.stride - point.anchor_x,
+					truth.y2 / point.stride - point.anchor_y
+				};
+
+				branch_loss += add_ciou_projection_delta(from, l, point, b, truth, box_scale, state.net.w, state.net.h);
+				for (int side = 0; side < 4; ++side)
+				{
+					branch_loss += add_dfl_delta(from, b, point.x, point.y, side, l.reg_max, target_distances[side], dfl_scale);
+				}
+			}
+		}
+
+		return branch_loss;
+	}
+
 	static void train_yolov9_layer(Darknet::Layer & l, Darknet::NetworkState state)
 	{
 		if (state.truth == nullptr)
@@ -175,108 +526,12 @@ namespace
 		}
 
 		zero_input_deltas(l, state);
-
-		float cls_loss = 0.0f;
-		float dfl_loss = 0.0f;
-		float box_loss = 0.0f;
-		int assignments = 0;
-
-		const float negative_scale = l.cls_normalizer / std::max(1, l.classes * 16);
-		const int branch_offset = selected_branch_offset(l);
-		for (int scale_idx = 0; scale_idx < l.n; ++scale_idx)
+		float loss = 0.0f;
+		for (int branch = 0; branch < l.branch_count; ++branch)
 		{
-			Darknet::Layer & from = state.net.layers[l.input_layers[branch_offset + scale_idx]];
-			for (int b = 0; b < l.batch; ++b)
-			{
-				for (int y = 0; y < from.out_h; ++y)
-				{
-					for (int x = 0; x < from.out_w; ++x)
-					{
-						for (int class_id = 0; class_id < l.classes; ++class_id)
-						{
-							const int channel = 4 * l.reg_max + class_id;
-							const int index = yolov9_channel_index(from, b, channel, y, x);
-							const float prediction = sigmoid(from.output[index]);
-							from.delta[index] += negative_scale * (0.0f - prediction);
-							cls_loss += -std::log(std::max(1.0f - prediction, 1e-6f));
-						}
-					}
-				}
-			}
+			loss += train_yolov9_branch(l, state, branch);
 		}
-
-		for (int b = 0; b < l.batch; ++b)
-		{
-			for (int t = 0; t < l.max_boxes; ++t)
-			{
-				const float * truth_ptr = state.truth + b * l.truths + t * l.truth_size;
-				const Darknet::Box truth = float_to_box_stride(truth_ptr, 1);
-				if (truth.x <= 0.0f)
-				{
-					break;
-				}
-
-				const int class_id = static_cast<int>(truth_ptr[4]);
-				if (class_id < 0 or class_id >= l.classes)
-				{
-					darknet_fatal_error(DARKNET_LOC, "invalid class ID #%d", class_id);
-				}
-
-				const float truth_w_pixels = truth.w * state.net.w;
-				const float truth_h_pixels = truth.h * state.net.h;
-				const float truth_size_pixels = std::max(truth_w_pixels, truth_h_pixels);
-
-				int best_scale = 0;
-				float best_scale_distance = FLT_MAX;
-				for (int scale_idx = 0; scale_idx < l.n; ++scale_idx)
-				{
-					const float scale_distance = std::fabs(std::log2(std::max(1.0f, truth_size_pixels) / std::max(1, l.strides[scale_idx])));
-					if (scale_distance < best_scale_distance)
-					{
-						best_scale_distance = scale_distance;
-						best_scale = scale_idx;
-					}
-				}
-
-				Darknet::Layer & from = state.net.layers[l.input_layers[branch_offset + best_scale]];
-				const int stride = std::max(1, l.strides[best_scale]);
-				const int cell_x = std::max(0, std::min(from.out_w - 1, static_cast<int>(truth.x * state.net.w / stride)));
-				const int cell_y = std::max(0, std::min(from.out_h - 1, static_cast<int>(truth.y * state.net.h / stride)));
-
-				const float anchor_x = cell_x + 0.5f;
-				const float anchor_y = cell_y + 0.5f;
-				const float x1 = (truth.x - truth.w * 0.5f) * state.net.w / stride;
-				const float y1 = (truth.y - truth.h * 0.5f) * state.net.h / stride;
-				const float x2 = (truth.x + truth.w * 0.5f) * state.net.w / stride;
-				const float y2 = (truth.y + truth.h * 0.5f) * state.net.h / stride;
-				const float target_distances[4] =
-				{
-					anchor_x - x1,
-					anchor_y - y1,
-					x2 - anchor_x,
-					y2 - anchor_y
-				};
-
-				for (int side = 0; side < 4; ++side)
-				{
-					add_dfl_delta(from, b, cell_x, cell_y, side, l.reg_max, target_distances[side], l.dfl_normalizer);
-					dfl_loss += std::max(0.0f, target_distances[side]);
-				}
-
-				add_class_delta(from, b, cell_x, cell_y, class_id, l.classes, l.reg_max, 1.0f, l.cls_normalizer);
-				float best_score = 0.0f;
-				best_class_score(from, b, cell_x, cell_y, l.classes, l.reg_max, best_score);
-				cls_loss += -std::log(std::max(best_score, 1e-6f));
-
-				const Darknet::Box pred = decode_prediction(from, b, cell_x, cell_y, stride, l.reg_max, state.net.w, state.net.h);
-				const float iou = box_iou(pred, truth);
-				box_loss += 1.0f - iou;
-				assignments++;
-			}
-		}
-
-		const float normalizer = 1.0f / std::max(1, assignments);
-		l.cost[0] = normalizer * (l.box_normalizer * box_loss + l.cls_normalizer * cls_loss + l.dfl_normalizer * dfl_loss);
+		l.cost[0] = loss;
 	}
 }
 
@@ -452,6 +707,47 @@ float yolov9_dfl_project(const float * logits, int reg_max)
 		value += static_cast<float>(i) * probs[i];
 	}
 	return value;
+}
+
+
+float yolov9_dfl_cross_entropy_delta(const float * logits, const int reg_max, const float target_distance, const float scale, float * delta)
+{
+	float probs[64];
+	if (reg_max <= 0 or reg_max > static_cast<int>(sizeof(probs) / sizeof(probs[0])))
+	{
+		darknet_fatal_error(DARKNET_LOC, "YOLOv9 reg_max=%d exceeds local DFL buffer", reg_max);
+	}
+	softmax_bins(logits, reg_max, probs);
+
+	const float clipped = std::max(0.0f, std::min(target_distance, static_cast<float>(reg_max) - 1.01f));
+	const int left_bin = static_cast<int>(std::floor(clipped));
+	const int right_bin = std::min(left_bin + 1, reg_max - 1);
+	const float right_weight = clipped - left_bin;
+	const float left_weight = 1.0f - right_weight;
+
+	float loss = 0.0f;
+	for (int bin = 0; bin < reg_max; ++bin)
+	{
+		float target = 0.0f;
+		if (bin == left_bin)
+		{
+			target += left_weight;
+		}
+		if (bin == right_bin)
+		{
+			target += right_weight;
+		}
+		if (delta)
+		{
+			delta[bin] = scale * (target - probs[bin]);
+		}
+		if (target > 0.0f)
+		{
+			loss += -target * std::log(std::max(probs[bin], 1.0e-12f));
+		}
+	}
+
+	return scale * loss;
 }
 
 
@@ -657,10 +953,9 @@ void forward_yolov9_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state)
 {
 	TAT(TATPARMS);
 
-	const int branch_offset = selected_branch_offset(l);
-	for (int i = 0; i < l.n; ++i)
+	for (int i = 0; i < l.total; ++i)
 	{
-		Darknet::Layer & from = state.net.layers[l.input_layers[branch_offset + i]];
+		Darknet::Layer & from = state.net.layers[l.input_layers[i]];
 		cuda_pull_array(from.output_gpu, from.output, from.batch * from.outputs);
 	}
 
@@ -681,9 +976,9 @@ void forward_yolov9_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state)
 	if (state.train and not l.onlyforward)
 	{
 		cuda_push_array(l.delta_gpu, l.delta, l.batch * l.outputs);
-		for (int i = 0; i < l.n; ++i)
+		for (int i = 0; i < l.total; ++i)
 		{
-			Darknet::Layer & from = state.net.layers[l.input_layers[branch_offset + i]];
+			Darknet::Layer & from = state.net.layers[l.input_layers[i]];
 			cuda_push_array(from.delta_gpu, from.delta, from.batch * from.outputs);
 		}
 	}

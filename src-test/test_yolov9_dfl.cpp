@@ -71,6 +71,24 @@ TEST(YOLOv9LayerRuntime, DFLProjectionMatchesReferenceHelper)
 	ASSERT_NEAR(2.0f, yolov9_dfl_project(logits.data(), 4), 1.0e-6f);
 }
 
+TEST(YOLOv9LayerRuntime, DFLCrossEntropyReturnsReferenceDeltas)
+{
+	const auto logits = logits_from_probabilities(
+		{
+			std::array<float, 4>{0.10f, 0.20f, 0.30f, 0.40f}
+		});
+	float deltas[4] = {};
+
+	const float loss = yolov9_dfl_cross_entropy_delta(logits.data(), 4, 1.25f, 2.0f, deltas);
+	const float expected_loss = 2.0f * (0.75f * -std::log(0.20f) + 0.25f * -std::log(0.30f));
+
+	ASSERT_NEAR(expected_loss, loss, 1.0e-6f);
+	ASSERT_NEAR(-0.20f, deltas[0], 1.0e-6f);
+	ASSERT_NEAR(1.10f, deltas[1], 1.0e-6f);
+	ASSERT_NEAR(-0.10f, deltas[2], 1.0e-6f);
+	ASSERT_NEAR(-0.80f, deltas[3], 1.0e-6f);
+}
+
 TEST(YOLOv9LayerRuntime, Dist2BBoxProducesNormalizedXYWH)
 {
 	const float ltrb[4] = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -252,6 +270,34 @@ TEST(YOLOv9Cfg, ParsesGelanTinyLegoGears)
 	ASSERT_EQ(32, output.strides[2]);
 
 	for (int idx = 0; idx < output.n; ++idx)
+	{
+		const Darknet::Layer & prediction = net.layers[output.input_layers[idx]];
+		ASSERT_EQ(69, prediction.out_c);
+	}
+
+	free_network(net);
+}
+
+TEST(YOLOv9Cfg, ParsesDualBranchTinyLegoGears)
+{
+	const std::string cfg = find_repo_file("cfg/yolov9-t-legogears.cfg");
+	Darknet::Network net = parse_network_cfg_custom(cfg.c_str(), 1, 1);
+
+	ASSERT_GT(net.n, 0);
+	const Darknet::Layer & output = net.layers[net.n - 1];
+	ASSERT_EQ(Darknet::ELayerType::YOLOV9, output.type);
+	ASSERT_EQ(5, output.classes);
+	ASSERT_EQ(16, output.reg_max);
+	ASSERT_EQ(3, output.n);
+	ASSERT_EQ(6, output.total);
+	ASSERT_EQ(2, output.branch_count);
+	ASSERT_EQ(1, output.inference_branch);
+	ASSERT_FLOAT_EQ(0.25f, output.aux_loss_weight);
+	ASSERT_EQ(8, output.strides[0]);
+	ASSERT_EQ(16, output.strides[1]);
+	ASSERT_EQ(32, output.strides[2]);
+
+	for (int idx = 0; idx < output.total; ++idx)
 	{
 		const Darknet::Layer & prediction = net.layers[output.input_layers[idx]];
 		ASSERT_EQ(69, prediction.out_c);

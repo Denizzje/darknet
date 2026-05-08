@@ -13,6 +13,7 @@ int get_yolov9_detections(const Darknet::Network * net, const Darknet::Layer & l
 int get_yolov9_detections_batch(const Darknet::Network * net, const Darknet::Layer & l, int w, int h, int netw, int neth, float thresh, int *map, int relative, Darknet::Detection *dets, int letter, int batch);
 
 float yolov9_dfl_project(const float *logits, int reg_max);
+float yolov9_dfl_cross_entropy_delta(const float *logits, int reg_max, float target_distance, float scale, float *delta);
 Darknet::Box yolov9_dist2bbox(float anchor_x, float anchor_y, const float distances[4], float stride, int netw, int neth);
 
 #ifdef DARKNET_GPU
