@@ -162,6 +162,7 @@ void free_layer_custom(Darknet::Layer & l, int keep_cudnn_desc)
 	if (l.cost)							free_and_clear(l.cost);
 	if (l.labels && !l.detection)		free_and_clear(l.labels);
 	if (l.class_ids && !l.detection)	free_and_clear(l.class_ids);
+	if (l.strides)						free_and_clear(l.strides);
 	if (l.cos_sim)						free_and_clear(l.cos_sim);
 	if (l.exp_cos_sim)					free_and_clear(l.exp_cos_sim);
 	if (l.p_constrastive)				free_and_clear(l.p_constrastive);

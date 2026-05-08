@@ -826,6 +826,20 @@ Darknet::Network & Darknet::CfgFile::create_network(int batch, int time_steps)
 			case ELayerType::REORG:			{l = parse_reorg_section(idx);									break;}
 			case ELayerType::AVGPOOL:		{l = parse_avgpool_section(idx);								break;}
 			case ELayerType::YOLO:			{l = parse_yolo_section(idx);			l.keep_delta_gpu = 1;	break;}
+			case ELayerType::YOLOV9:
+			{
+				l = parse_yolov9_section(idx);
+				l.keep_delta_gpu = 1;
+				for (int k = 0; k < l.total; ++k)
+				{
+					net.layers[l.input_layers[k]].use_bin_output = 0;
+					if (idx >= parms.last_stop_backward)
+					{
+						net.layers[l.input_layers[k]].keep_delta_gpu = 1;
+					}
+				}
+				break;
+			}
 			case ELayerType::COST:			{l = parse_cost_section(idx);			l.keep_delta_gpu = 1;	break;}
 			case ELayerType::REGION:		{l = parse_region_section(idx);			l.keep_delta_gpu = 1;	break;}
 			case ELayerType::GAUSSIAN_YOLO:	{l = parse_gaussian_yolo_section(idx);	l.keep_delta_gpu = 1;	break;}
@@ -1203,7 +1217,7 @@ Darknet::Network & Darknet::CfgFile::create_network(int batch, int time_steps)
 #endif
 
 	Darknet::ELayerType lt = net.layers[net.n - 1].type;
-	if (lt == Darknet::ELayerType::YOLO || lt == Darknet::ELayerType::REGION)
+	if (lt == Darknet::ELayerType::YOLO || lt == Darknet::ELayerType::YOLOV9 || lt == Darknet::ELayerType::REGION)
 	{
 		if (net.w % 32 != 0 ||
 			net.h % 32 != 0 ||
@@ -1717,6 +1731,125 @@ Darknet::Layer Darknet::CfgFile::parse_yolo_section(const size_t section_idx)
 	for (size_t i = 0; i < vf.size(); i ++)
 	{
 		l.biases[i] = vf[i];
+	}
+
+	return l;
+}
+
+
+Darknet::Layer Darknet::CfgFile::parse_yolov9_section(const size_t section_idx)
+{
+	TAT(TATPARMS);
+
+	auto & s = sections.at(section_idx);
+
+	const auto v = s.find_int_array("layers");
+	if (v.empty())
+	{
+		darknet_fatal_error(DARKNET_LOC, "yolov9 layer at line #%ld must specify input layers", s.line_number);
+	}
+
+	const int classes = s.find_int("classes", 80);
+	const int reg_max = s.find_int("reg_max", 16);
+	const int branch_count = s.find_int("branch_count", 1);
+	const int inference_branch = s.find_int("inference_branch", branch_count > 1 ? branch_count - 1 : 0);
+	const int max_boxes = s.find_int("max", 200);
+	const int expected_channels = classes + 4 * reg_max;
+	const int input_count = static_cast<int>(v.size());
+	if (classes < 1)
+	{
+		darknet_fatal_error(DARKNET_LOC, "[yolov9] classes must be positive on line #%ld", s.line_number);
+	}
+	if (reg_max < 1)
+	{
+		darknet_fatal_error(DARKNET_LOC, "[yolov9] reg_max must be positive on line #%ld", s.line_number);
+	}
+	if (branch_count < 1)
+	{
+		darknet_fatal_error(DARKNET_LOC, "[yolov9] branch_count must be positive on line #%ld", s.line_number);
+	}
+	if (input_count % branch_count != 0)
+	{
+		darknet_fatal_error(DARKNET_LOC, "[yolov9] layer count (%d) must be divisible by branch_count=%d on line #%ld", input_count, branch_count, s.line_number);
+	}
+	if (inference_branch < 0 || inference_branch >= branch_count)
+	{
+		darknet_fatal_error(DARKNET_LOC, "[yolov9] inference_branch=%d is outside [0, %d) on line #%ld", inference_branch, branch_count, s.line_number);
+	}
+	const int scale_count = input_count / branch_count;
+	const auto stride_values = s.find_int_array("strides");
+	if (stride_values.size() != scale_count)
+	{
+		darknet_fatal_error(DARKNET_LOC, "[yolov9] layer at line #%ld must specify one stride per scale (%d), not %ld", s.line_number, scale_count, stride_values.size());
+	}
+
+	int * layers = (int*)xcalloc(input_count, sizeof(int));
+	int * sizes = (int*)xcalloc(input_count, sizeof(int));
+	int * strides = (int*)xcalloc(scale_count, sizeof(int));
+
+	for (int idx = 0; idx < input_count; idx ++)
+	{
+		int layer_index = v[idx];
+		if (layer_index < 0)
+		{
+			layer_index = parms.index + layer_index;
+		}
+
+		if (layer_index >= parms.index)
+		{
+			darknet_fatal_error(DARKNET_LOC, "cannot use future layer #%d in [%s] at line #%ld", layer_index, s.name.c_str(), s.line_number);
+		}
+
+		const Darknet::Layer & input = net.layers[layer_index];
+		if (input.out_w <= 0 || input.out_h <= 0 || input.out_c != expected_channels)
+		{
+			darknet_fatal_error(DARKNET_LOC, "layer #%d before [yolov9] at line #%ld has %d x %d x %d output, expected image output with classes + 4 * reg_max = %d channels", layer_index, s.line_number, input.out_w, input.out_h, input.out_c, expected_channels);
+		}
+
+		layers[idx] = layer_index;
+		sizes[idx] = input.outputs;
+		if (parms.train)
+		{
+			net.layers[layer_index].keep_delta_gpu = 1;
+		}
+	}
+	for (int idx = 0; idx < scale_count; ++idx)
+	{
+		if (stride_values[idx] <= 0)
+		{
+			darknet_fatal_error(DARKNET_LOC, "[yolov9] stride #%d must be positive on line #%ld", idx, s.line_number);
+		}
+		strides[idx] = stride_values[idx];
+	}
+
+	int total_points = 0;
+	const int inference_offset = inference_branch * scale_count;
+	for (int scale = 0; scale < scale_count; ++scale)
+	{
+		const Darknet::Layer & input = net.layers[layers[inference_offset + scale]];
+		total_points += input.out_w * input.out_h;
+	}
+
+	Darknet::Layer l = make_yolov9_layer(parms.batch, classes, reg_max, branch_count, inference_branch, input_count, layers, sizes, strides, max_boxes, total_points);
+
+	l.aux_loss_weight = s.find_float("aux_loss_weight", 0.25f);
+	l.box_normalizer = s.find_float("box_normalizer", 7.5f);
+	l.cls_normalizer = s.find_float("cls_normalizer", 0.5f);
+	l.dfl_normalizer = s.find_float("dfl_normalizer", 1.5f);
+	l.tal_topk = s.find_int("tal_topk", 10);
+	l.tal_alpha = s.find_float("tal_alpha", 0.5f);
+	l.tal_beta = s.find_float("tal_beta", 6.0f);
+	l.iou_loss = static_cast<IOU_LOSS>(get_IoU_loss_from_name(s.find_str("iou_loss", "ciou")));
+	l.nms_kind = static_cast<NMS_KIND>(get_NMS_kind_from_name(s.find_str("nms_kind", "default")));
+	l.beta_nms = s.find_float("beta_nms", 0.6f);
+	l.jitter = s.find_float("jitter", .2f);
+	l.resize = s.find_float("resize", 1.0f);
+	l.random = s.find_float("random", 0.0f);
+
+	const std::string map_file = s.find_str("map");
+	if (not map_file.empty())
+	{
+		l.map = read_map(map_file.c_str());
 	}
 
 	return l;

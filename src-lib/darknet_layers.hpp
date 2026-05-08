@@ -200,6 +200,16 @@ namespace Darknet
 		float * cost;
 		int *labels;
 		int *class_ids;
+		int reg_max;
+		int *strides;
+		int branch_count;
+		int inference_branch;
+		int tal_topk;
+		float tal_alpha;
+		float tal_beta;
+		float aux_loss_weight;
+		float box_normalizer;
+		float dfl_normalizer;
 		int contrastive_neg_max; ///< @todo V5: possibly unused?
 		float *cos_sim;
 		float *exp_cos_sim;
@@ -525,3 +535,4 @@ namespace Darknet
 #include "softmax_layer.hpp"
 #include "upsample_layer.hpp"
 #include "yolo_layer.hpp"
+#include "yolov9_layer.hpp"

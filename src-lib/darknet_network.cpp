@@ -665,6 +665,7 @@ int resize_network(Darknet::Network * net, int w, int h)
 			case Darknet::ELayerType::LOCAL_AVGPOOL:	resize_maxpool_layer(&l, w, h);				break;
 			case Darknet::ELayerType::REGION:			resize_region_layer(&l, w, h);				break;
 			case Darknet::ELayerType::YOLO:				resize_yolo_layer(&l, w, h);				break;
+			case Darknet::ELayerType::YOLOV9:			resize_yolov9_layer(&l, net);				break;
 			case Darknet::ELayerType::GAUSSIAN_YOLO:	resize_gaussian_yolo_layer(&l, w, h);		break;
 			case Darknet::ELayerType::ROUTE:			resize_route_layer(&l, net);				break;
 			case Darknet::ELayerType::SHORTCUT:			resize_shortcut_layer(&l, w, h, net);		break;
@@ -881,6 +882,11 @@ int num_detections(Darknet::Network * net, float thresh)
 			s += yolo_num_detections(l, thresh);
 		}
 
+		if (l.type == Darknet::ELayerType::YOLOV9)
+		{
+			s += yolov9_num_detections(net, l, thresh);
+		}
+
 		if (l.type == Darknet::ELayerType::GAUSSIAN_YOLO)
 		{
 			s += gaussian_yolo_num_detections(l, thresh);
@@ -910,6 +916,10 @@ int num_detections_v3(Darknet::Network * net, float thresh, Darknet::Output_Obje
 		{
 			/// @todo V3 JAZZ:  this is where we spend all our time
 			detections += yolo_num_detections_v3(net, i, thresh, cache);
+		}
+		else if (l.type == Darknet::ELayerType::YOLOV9)
+		{
+			detections += yolov9_num_detections_v3(net, i, thresh, cache);
 		}
 
 		/// @todo Is this still used in a modern .cfg file?  Should it be removed?
@@ -941,6 +951,10 @@ int num_detections_batch(Darknet::Network * net, float thresh, int batch)
 		{
 			s += yolo_num_detections_batch(l, thresh, batch);
 		}
+		else if (l.type == Darknet::ELayerType::YOLOV9)
+		{
+			s += yolov9_num_detections_batch(net, l, thresh, batch);
+		}
 		else if (l.type == Darknet::ELayerType::REGION)
 		{
 			s += l.w*l.h*l.n;
@@ -965,6 +979,7 @@ DarknetDetection * make_network_boxes(DarknetNetworkPtr ptr, float thresh, int *
 	{
 		Darknet::Layer & l_tmp = net->layers[i];
 		if (l_tmp.type == Darknet::ELayerType::YOLO or
+			l_tmp.type == Darknet::ELayerType::YOLOV9 or
 			l_tmp.type == Darknet::ELayerType::GAUSSIAN_YOLO or
 			l_tmp.type == Darknet::ELayerType::REGION or
 			i == (net->n - 1))
@@ -1033,6 +1048,7 @@ Darknet::Detection * make_network_boxes_v3(Darknet::Network * net, const float t
 
 			const Darknet::Layer & tmp = net->layers[i];
 			if (tmp.type == Darknet::ELayerType::YOLO			or
+				tmp.type == Darknet::ELayerType::YOLOV9			or
 				tmp.type == Darknet::ELayerType::GAUSSIAN_YOLO	or
 				tmp.type == Darknet::ELayerType::REGION			)
 			{
@@ -1090,6 +1106,7 @@ Darknet::Detection *make_network_boxes_batch(Darknet::Network * net, float thres
 	{
 		const Darknet::Layer & l_tmp = net->layers[i];
 		if (l_tmp.type == Darknet::ELayerType::YOLO or
+			l_tmp.type == Darknet::ELayerType::YOLOV9 or
 			l_tmp.type == Darknet::ELayerType::GAUSSIAN_YOLO or
 			l_tmp.type == Darknet::ELayerType::REGION)
 		{
@@ -1204,6 +1221,20 @@ void fill_network_boxes(Darknet::Network * net, int w, int h, float thresh, floa
 				}
 				break;
 			}
+			case Darknet::ELayerType::YOLOV9:
+			{
+				int count = get_yolov9_detections(net, l, w, h, net->w, net->h, thresh, map, relative, dets, letter);
+				dets += count;
+				if (prev_classes < 0)
+				{
+					prev_classes = l.classes;
+				}
+				else if (prev_classes != l.classes)
+				{
+					darknet_fatal_error(DARKNET_LOC, "Different [yolov9] layers have different number of classes (%d and %d)", prev_classes, l.classes);
+				}
+				break;
+			}
 			case Darknet::ELayerType::GAUSSIAN_YOLO:
 			{
 				int count = get_gaussian_yolo_detections(l, w, h, net->w, net->h, thresh, map, relative, dets, letter);
@@ -1230,10 +1261,24 @@ static inline void fill_network_boxes_v3(Darknet::Network * net, int w, int h, f
 {
 	TAT(TATPARMS);
 
-	/** @todo This assumes that "GAUSSIAN_YOLO", "REGION", and "DETECTION" layers don't exist, which is wrong.  But
-	 * they only exist in much older configurations which are hopefully not used anymore?  Should we deprecate these?
-	 */
-	dets += get_yolo_detections_v3(net, w, h, net->w, net->h, thresh, map, relative, dets, letter, cache);
+	bool only_yolo_cache = true;
+	for (const auto & oo : cache)
+	{
+		if (net->layers[oo.layer_index].type != Darknet::ELayerType::YOLO)
+		{
+			only_yolo_cache = false;
+			break;
+		}
+	}
+
+	if (only_yolo_cache)
+	{
+		dets += get_yolo_detections_v3(net, w, h, net->w, net->h, thresh, map, relative, dets, letter, cache);
+	}
+	else
+	{
+		fill_network_boxes(net, w, h, thresh, hier, map, relative, dets, letter);
+	}
 }
 
 
@@ -1256,6 +1301,19 @@ void fill_network_boxes_batch(Darknet::Network * net, int w, int h, float thresh
 			else if (prev_classes != l.classes)
 			{
 				darknet_fatal_error(DARKNET_LOC, "Different [yolo] layers have different number of classes = %d and %d - check your cfg-file!", prev_classes, l.classes);
+			}
+		}
+		else if (l.type == Darknet::ELayerType::YOLOV9)
+		{
+			int count = get_yolov9_detections_batch(net, l, w, h, net->w, net->h, thresh, map, relative, dets, letter, batch);
+			dets += count;
+			if (prev_classes < 0)
+			{
+				prev_classes = l.classes;
+			}
+			else if (prev_classes != l.classes)
+			{
+				darknet_fatal_error(DARKNET_LOC, "Different [yolov9] layers have different number of classes = %d and %d - check your cfg-file!", prev_classes, l.classes);
 			}
 		}
 		else if (l.type == Darknet::ELayerType::REGION)
@@ -1288,10 +1346,29 @@ DarknetDetection * get_network_boxes(DarknetNetworkPtr ptr, int w, int h, float 
 #else
 	// With V3 Jazz, we now create a "cache" list to track objects in the output array.
 
-	Darknet::Output_Object_Cache cache;
-	cache.reserve(250); // reserve 250 spaces in the cache to start (most YOLO networks don't have 250 objects per image!)
-	Darknet::Detection * dets = make_network_boxes_v3(net, thresh, num, cache);
-	fill_network_boxes_v3(net, w, h, thresh, hier, map, relative, dets, letter, cache);
+	bool has_yolov9 = false;
+	for (int i = 0; i < net->n; ++i)
+	{
+		if (net->layers[i].type == Darknet::ELayerType::YOLOV9)
+		{
+			has_yolov9 = true;
+			break;
+		}
+	}
+
+	Darknet::Detection * dets = nullptr;
+	if (has_yolov9)
+	{
+		dets = make_network_boxes(net, thresh, num);
+		fill_network_boxes(net, w, h, thresh, hier, map, relative, dets, letter);
+	}
+	else
+	{
+		Darknet::Output_Object_Cache cache;
+		cache.reserve(250); // reserve 250 spaces in the cache to start (most YOLO networks don't have 250 objects per image!)
+		dets = make_network_boxes_v3(net, thresh, num, cache);
+		fill_network_boxes_v3(net, w, h, thresh, hier, map, relative, dets, letter, cache);
+	}
 #endif
 
 	return dets;

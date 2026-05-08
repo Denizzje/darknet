@@ -241,6 +241,7 @@ namespace Darknet
 			Darknet::Layer	parse_route_section			(const size_t section_idx);
 			Darknet::Layer	parse_maxpool_section		(const size_t section_idx);
 			Darknet::Layer	parse_yolo_section			(const size_t section_idx);
+			Darknet::Layer	parse_yolov9_section		(const size_t section_idx);
 			Darknet::Layer	parse_upsample_section		(const size_t section_idx);
 			Darknet::Layer	parse_shortcut_section		(const size_t section_idx);
 			Darknet::Layer	parse_connected_section		(const size_t section_idx);

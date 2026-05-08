@@ -1,0 +1,5 @@
+classes = 5
+train = test_training_set/LegoGears_v2/LegoGears_train.local.txt
+valid = test_training_set/LegoGears_v2/LegoGears_valid.local.txt
+names = test_training_set/LegoGears_v2/LegoGears.names
+backup = test_training_set/LegoGears_v2/backup

@@ -682,7 +682,7 @@ float *get_network_output_layer_gpu(Darknet::Network & net, int i)
 	TAT(TATPARMS);
 
 	Darknet::Layer & l = net.layers[i];
-	if (l.type != Darknet::ELayerType::REGION && l.type != Darknet::ELayerType::YOLO && (*net.cuda_graph_ready) == 0)
+	if (l.type != Darknet::ELayerType::REGION && l.type != Darknet::ELayerType::YOLO && l.type != Darknet::ELayerType::YOLOV9 && (*net.cuda_graph_ready) == 0)
 	{
 		cuda_pull_array(l.output_gpu, l.output, l.outputs*l.batch);
 	}

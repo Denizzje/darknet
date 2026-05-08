@@ -1,0 +1,16 @@
+test_training_set/LegoGears_v2/set_03/DSCN2164_frame_000035.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2164_frame_000084.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2164_frame_000104.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2164_frame_000120.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2164_frame_000146.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2164_frame_000358.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2164_frame_000369.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2166_frame_000040.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2166_frame_000052.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2166_frame_000101.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2166_frame_000321.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2167_frame_000061.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2167_frame_000147.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2167_frame_000238.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2167_frame_000359.jpg
+test_training_set/LegoGears_v2/set_03/DSCN2167_frame_000532.jpg

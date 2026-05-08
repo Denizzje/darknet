@@ -628,6 +628,7 @@ float validate_detector_map(const char * datacfg, const char * cfgfile, const ch
 	{
 		Darknet::Layer & lk = shared_info.net.layers[k];
 		if (lk.type == Darknet::ELayerType::YOLO			or
+			lk.type == Darknet::ELayerType::YOLOV9		or
 			lk.type == Darknet::ELayerType::GAUSSIAN_YOLO	or
 			lk.type == Darknet::ELayerType::REGION			)
 		{
