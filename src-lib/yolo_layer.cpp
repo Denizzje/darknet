@@ -1273,6 +1273,7 @@ int yolo_num_detections_v3(Darknet::Network * net, const int index, const float 
 				oo.n = n;
 				oo.i = i;
 				oo.obj_index = obj_index;
+				oo.compact_index = -1;
 				cache.push_back(oo);
 			}
 		}

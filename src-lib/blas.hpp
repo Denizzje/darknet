@@ -141,12 +141,14 @@ void inverse_variance_ongpu(int size, float *src, float *dst, float epsilon);
 void normalize_scale_bias_gpu(float *x, float *mean, float *variance, float *scales, float *biases, int batch, int filters, int spatial, int inverse_variance, float epsilon);
 void shortcut_gpu(int batch, int w1, int h1, int c1, float *add, int w2, int h2, int c2, float *out);
 void shortcut_multilayer_gpu(int src_outputs, int batch, int n, int *outputs_of_layers_gpu, float **layers_output_gpu, float *out, float *in, float *weights_gpu, int nweights, WEIGHTS_NORMALIZATION_T weights_normalization);
+void shortcut_singlelayer_swish_gpu(int src_outputs, int batch, int *outputs_of_layers_gpu, float **layers_output_gpu, float *out, float *in);
 void backward_shortcut_multilayer_gpu(int src_outputs, int batch, int n, int *outputs_of_layers_gpu, float **layers_delta_gpu, float *delta_out, float *delta_in, float *weights, float *weight_updates, int nweights, float *in, float **layers_output, WEIGHTS_NORMALIZATION_T weights_normalization);
 void input_shortcut_gpu(float *in, int batch, int w1, int h1, int c1, float *add, int w2, int h2, int c2, float *out);
 void backward_scale_gpu(float *x_norm, float *delta, int batch, int n, int size, float *scale_updates);
 void mean_array_gpu(float *src, int size, float alpha, float *avg);
 void scale_bias_gpu(float *output, float *biases, int batch, int n, int size);
 void add_bias_gpu(float *output, float *biases, int batch, int n, int size);
+void add_bias_swish_gpu(float *output, float *biases, int batch, int n, int size);
 void backward_bias_gpu(float *bias_updates, float *delta, int batch, int n, int size);
 
 void softmax_x_ent_gpu(int n, float *pred, float *truth, float *delta, float *error);

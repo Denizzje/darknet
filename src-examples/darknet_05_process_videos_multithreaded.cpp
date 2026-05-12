@@ -62,6 +62,11 @@ std::chrono::high_resolution_clock::duration wait_threads_duration;	///< amount 
 std::chrono::high_resolution_clock::duration reader_work_duration;	///< amount of time spent reading frames
 std::chrono::high_resolution_clock::duration resize_work_duration;	///< amount of time spent resizing frames
 std::chrono::high_resolution_clock::duration predict_work_duration;	///< amount of time spent predicting frames
+std::chrono::high_resolution_clock::duration network_forward_duration;	///< amount of time spent in the network forward pass
+std::chrono::high_resolution_clock::duration postprocess_duration;	///< amount of time spent extracting detections
+std::chrono::high_resolution_clock::duration nms_duration;	///< amount of time spent in NMS
+std::chrono::high_resolution_clock::duration prediction_conversion_duration;	///< amount of time spent converting predictions to C++ API objects
+std::chrono::high_resolution_clock::duration annotate_work_duration;	///< amount of time spent drawing detections
 std::chrono::high_resolution_clock::duration output_work_duration;	///< amount of time spent on the output video
 size_t				reader_must_pause		= 0;
 size_t				resize_thread_starved	= 0;
@@ -140,9 +145,6 @@ void detection_thread(size_t & total_objects_found)
 				continue;
 			}
 
-			// if we get here we know we have at least 1 frame where we can call predict()
-			const auto timestamp_begin = std::chrono::high_resolution_clock::now();
-
 			Frame frame;
 			if (true)
 			{
@@ -152,8 +154,21 @@ void detection_thread(size_t & total_objects_found)
 				frames_waiting_for_prediction.erase(iter);
 			}
 
+			// if we get here we know we have at least 1 frame where we can call predict()
+			const auto predict_begin = std::chrono::high_resolution_clock::now();
 			frame.predictions = Darknet::predict(net, frame.img, frame.mat.size());
+			const auto predict_end = std::chrono::high_resolution_clock::now();
+			const auto timing = Darknet::latest_prediction_timing();
+			network_forward_duration += std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(std::chrono::duration<double, std::milli>(timing.network_forward_ms));
+			postprocess_duration += std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(std::chrono::duration<double, std::milli>(timing.postprocess_ms));
+			nms_duration += std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(std::chrono::duration<double, std::milli>(timing.nms_ms));
+			prediction_conversion_duration += std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(std::chrono::duration<double, std::milli>(timing.conversion_ms));
+			predict_work_duration += predict_end - predict_begin;
+
+			const auto annotate_begin = std::chrono::high_resolution_clock::now();
 			Darknet::annotate(net, frame.predictions, frame.mat);
+			const auto annotate_end = std::chrono::high_resolution_clock::now();
+			annotate_work_duration += annotate_end - annotate_begin;
 
 			total_objects_found += frame.predictions.size();
 
@@ -162,8 +177,6 @@ void detection_thread(size_t & total_objects_found)
 			std::scoped_lock lock(waiting_for_output);
 			frames_waiting_for_output.insert(frame);
 
-			const auto timestamp_end = std::chrono::high_resolution_clock::now();
-			predict_work_duration += timestamp_end - timestamp_begin;
 		}
 	}
 	catch(const std::exception & e)
@@ -284,6 +297,11 @@ int main(int argc, char * argv[])
 			reader_work_duration	= std::chrono::high_resolution_clock::duration();
 			resize_work_duration	= std::chrono::high_resolution_clock::duration();
 			predict_work_duration	= std::chrono::high_resolution_clock::duration();
+			network_forward_duration	= std::chrono::high_resolution_clock::duration();
+			postprocess_duration	= std::chrono::high_resolution_clock::duration();
+			nms_duration			= std::chrono::high_resolution_clock::duration();
+			prediction_conversion_duration = std::chrono::high_resolution_clock::duration();
+			annotate_work_duration	= std::chrono::high_resolution_clock::duration();
 			output_work_duration	= std::chrono::high_resolution_clock::duration();
 			reader_must_pause		= 0;
 			resize_thread_starved	= 0;
@@ -412,6 +430,10 @@ int main(int argc, char * argv[])
 			const auto processing_duration = timestamp_when_video_ended - timestamp_when_video_started;
 			const size_t processing_time_in_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(processing_duration).count();
 			const double final_fps = 1000.0 * frame_counter / processing_time_in_milliseconds;
+			const auto duration_ms = [](const auto duration)
+			{
+				return std::chrono::duration<double, std::milli>(duration).count();
+			};
 
 			std::cout
 				<< "-> total frames processed ... " << frame_counter											<< std::endl
@@ -420,6 +442,16 @@ int main(int argc, char * argv[])
 				<< "-> processed frame rate ..... " << final_fps << " FPS"										<< std::endl
 				<< "-> total objects found ...... " << total_objects_found										<< std::endl
 				<< "-> average objects/frame .... " << static_cast<float>(total_objects_found) / frame_counter	<< std::endl
+				<< "-> profile read ms .......... " << duration_ms(reader_work_duration)						<< std::endl
+				<< "-> profile resize ms ........ " << duration_ms(resize_work_duration)						<< std::endl
+				<< "-> profile network ms ....... " << duration_ms(network_forward_duration)					<< std::endl
+				<< "-> profile postprocess ms ... " << duration_ms(postprocess_duration)						<< std::endl
+				<< "-> profile nms ms ........... " << duration_ms(nms_duration)								<< std::endl
+				<< "-> profile conversion ms .... " << duration_ms(prediction_conversion_duration)				<< std::endl
+				<< "-> profile predict_total ms . " << duration_ms(predict_work_duration)						<< std::endl
+				<< "-> profile annotation ms .... " << duration_ms(annotate_work_duration)						<< std::endl
+				<< "-> profile video_write ms ... " << duration_ms(output_work_duration)						<< std::endl
+				<< "-> profile wait ms .......... " << duration_ms(wait_threads_duration)						<< std::endl
 #if 0
 				// timing details are commented out, they're mostly for development purpose not end user consumption
 				<< "-> reader chose to pause .... " << reader_must_pause										<< std::endl

@@ -155,6 +155,9 @@ void free_layer_custom(Darknet::Layer & l, int keep_cudnn_desc)
 	if (l.indexes)						free_and_clear(l.indexes);
 	if (l.input_layers)					free_and_clear(l.input_layers);
 	if (l.input_sizes)					free_and_clear(l.input_sizes);
+	if (l.inference_fused_route_input_sizes) free_and_clear(l.inference_fused_route_input_sizes);
+	if (l.inference_fused_route_layers_output) free_and_clear(l.inference_fused_route_layers_output);
+	if (l.yolov9_compact_cpu)			free_and_clear(l.yolov9_compact_cpu);
 	if (l.layers_output)				free_and_clear(l.layers_output);
 	if (l.layers_delta)					free_and_clear(l.layers_delta);
 	if (l.map)							free_and_clear(l.map);
@@ -309,14 +312,23 @@ void free_layer_custom(Darknet::Layer & l, int keep_cudnn_desc)
 
 	if (l.cos_sim_gpu)					cuda_free_and_clear(l.cos_sim_gpu);
 	if (l.rand_gpu)						cuda_free_and_clear(l.rand_gpu);
+	if (l.loss_gpu)						cuda_free_and_clear(l.loss_gpu);
 	if (l.squared_gpu)					cuda_free_and_clear(l.squared_gpu);
 	if (l.norms_gpu)					cuda_free_and_clear(l.norms_gpu);
 	if (l.input_sizes_gpu)				cuda_free((float*)l.input_sizes_gpu);
 	if (l.layers_output_gpu)			cuda_free((float*)l.layers_output_gpu);
 	if (l.layers_delta_gpu)				cuda_free((float*)l.layers_delta_gpu);
+	if (l.inference_fused_route_input_sizes_gpu) cuda_free((float*)l.inference_fused_route_input_sizes_gpu);
+	if (l.inference_fused_route_layers_output_gpu) cuda_free((float*)l.inference_fused_route_layers_output_gpu);
+	if (l.yolov9_compact_count_gpu)		cuda_free((float*)l.yolov9_compact_count_gpu);
+	if (l.yolov9_compact_gpu)			cuda_free(l.yolov9_compact_gpu);
 	l.input_sizes_gpu	= nullptr;
 	l.layers_output_gpu	= nullptr;
 	l.layers_delta_gpu	= nullptr;
+	l.inference_fused_route_input_sizes_gpu = nullptr;
+	l.inference_fused_route_layers_output_gpu = nullptr;
+	l.yolov9_compact_count_gpu = nullptr;
+	l.yolov9_compact_gpu = nullptr;
 
 	// CONV-LSTM
 	if (l.f_gpu)						cuda_free_and_clear(l.f_gpu);

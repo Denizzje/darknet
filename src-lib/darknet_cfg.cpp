@@ -86,6 +86,54 @@ namespace
 
 		return classes_multipliers;
 	}
+
+
+	static void push_yolov9_biases_to_gpu(Darknet::Layer & layer)
+	{
+#ifdef DARKNET_GPU
+		if (layer.biases_gpu)
+		{
+			cuda_push_array(layer.biases_gpu, layer.biases, layer.n);
+		}
+#else
+		(void)layer;
+#endif
+	}
+
+
+	static void initialize_yolov9_head_biases(Darknet::Network & net, const int input_layer_index, const int classes, const int reg_max, const int stride)
+	{
+		Darknet::Layer & route = net.layers[input_layer_index];
+		if (route.type != Darknet::ELayerType::ROUTE or route.n < 2)
+		{
+			return;
+		}
+
+		Darknet::Layer & box_layer = net.layers[route.input_layers[0]];
+		Darknet::Layer & class_layer = net.layers[route.input_layers[1]];
+		if (box_layer.type != Darknet::ELayerType::CONVOLUTIONAL or class_layer.type != Darknet::ELayerType::CONVOLUTIONAL)
+		{
+			return;
+		}
+		if (box_layer.n != 4 * reg_max or class_layer.n != classes)
+		{
+			return;
+		}
+
+		for (int idx = 0; idx < box_layer.n; ++idx)
+		{
+			box_layer.biases[idx] = 1.0f;
+		}
+
+		const float class_bias = std::log(5.0f / static_cast<float>(classes) / std::pow(640.0f / static_cast<float>(stride), 2.0f));
+		for (int idx = 0; idx < class_layer.n; ++idx)
+		{
+			class_layer.biases[idx] = class_bias;
+		}
+
+		push_yolov9_biases_to_gpu(box_layer);
+		push_yolov9_biases_to_gpu(class_layer);
+	}
 }
 
 
@@ -1782,6 +1830,12 @@ Darknet::Layer Darknet::CfgFile::parse_yolov9_section(const size_t section_idx)
 	{
 		darknet_fatal_error(DARKNET_LOC, "[yolov9] layer at line #%ld must specify one stride per scale (%d), not %ld", s.line_number, scale_count, stride_values.size());
 	}
+	const std::string iou_loss = s.find_str("iou_loss", "ciou");
+	const IOU_LOSS yolov9_iou_loss = static_cast<IOU_LOSS>(get_IoU_loss_from_name(iou_loss));
+	if (yolov9_iou_loss != CIOU)
+	{
+		darknet_fatal_error(DARKNET_LOC, "[yolov9] iou_loss=%s is unsupported on line #%ld; YOLOv9 currently supports ciou only", iou_loss.c_str(), s.line_number);
+	}
 
 	int * layers = (int*)xcalloc(input_count, sizeof(int));
 	int * sizes = (int*)xcalloc(input_count, sizeof(int));
@@ -1839,7 +1893,7 @@ Darknet::Layer Darknet::CfgFile::parse_yolov9_section(const size_t section_idx)
 	l.tal_topk = s.find_int("tal_topk", 10);
 	l.tal_alpha = s.find_float("tal_alpha", 0.5f);
 	l.tal_beta = s.find_float("tal_beta", 6.0f);
-	l.iou_loss = static_cast<IOU_LOSS>(get_IoU_loss_from_name(s.find_str("iou_loss", "ciou")));
+	l.iou_loss = yolov9_iou_loss;
 	l.nms_kind = static_cast<NMS_KIND>(get_NMS_kind_from_name(s.find_str("nms_kind", "default")));
 	l.beta_nms = s.find_float("beta_nms", 0.6f);
 	l.jitter = s.find_float("jitter", .2f);
@@ -1850,6 +1904,14 @@ Darknet::Layer Darknet::CfgFile::parse_yolov9_section(const size_t section_idx)
 	if (not map_file.empty())
 	{
 		l.map = read_map(map_file.c_str());
+	}
+
+	if (parms.train and s.find_int("bias_init", 1))
+	{
+		for (int idx = 0; idx < input_count; ++idx)
+		{
+			initialize_yolov9_head_biases(net, layers[idx], classes, reg_max, strides[idx % scale_count]);
+		}
 	}
 
 	return l;

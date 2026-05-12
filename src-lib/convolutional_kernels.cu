@@ -3,10 +3,161 @@
 #include "col2im.hpp"
 #include "im2col.hpp"
 
+#include <cstdlib>
+
 
 namespace
 {
 	static auto & cfg_and_state = Darknet::CfgAndState::get();
+
+	static bool env_flag_is_set(const char * name)
+	{
+		const char * value = std::getenv(name);
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+	}
+
+	static bool is_optional_fast_1x1_half_conv(const Darknet::Layer & l, const Darknet::NetworkState & state)
+	{
+		return !state.train
+			&& l.size == 1
+			&& l.stride_x == 1
+			&& l.stride_y == 1
+			&& l.dilation == 1
+			&& l.groups == 1
+			&& env_flag_is_set("DARKNET_ENABLE_FAST_1X1_HALF")
+			&& !env_flag_is_set("DARKNET_DISABLE_FAST_1X1_HALF");
+	}
+
+	static bool is_optional_fast_grouped_half_conv(const Darknet::Layer & l, const Darknet::NetworkState & state)
+	{
+		return !state.train
+			&& l.groups > 1
+			&& l.stride_x == l.stride_y
+			&& l.dilation == 1
+			&& env_flag_is_set("DARKNET_ENABLE_FAST_GROUPED_HALF")
+			&& !env_flag_is_set("DARKNET_DISABLE_FAST_GROUPED_HALF");
+	}
+
+	static bool should_use_cudnn_half_forward(const Darknet::Layer & l, const Darknet::NetworkState & state, const int iteration_num)
+	{
+		if (state.index == 0 || !state.net.cudnn_half || l.xnor)
+		{
+			return false;
+		}
+		if (!state.train && env_flag_is_set("DARKNET_DISABLE_CUDNN_HALF_INFERENCE"))
+		{
+			return false;
+		}
+		if (state.train && !((iteration_num > 3 * state.net.burn_in) && state.net.loss_scale != 1))
+		{
+			return false;
+		}
+		if ((l.c / l.groups) % 8 != 0)
+		{
+			return false;
+		}
+		if (l.groups > 1)
+		{
+			return (l.n / l.groups) % 8 == 0 && is_optional_fast_grouped_half_conv(l, state);
+		}
+		if (l.n % 8 != 0)
+		{
+			return false;
+		}
+		if (l.size > 1)
+		{
+			return true;
+		}
+		return is_optional_fast_1x1_half_conv(l, state);
+	}
+
+	static bool should_fuse_add_bias_swish(const Darknet::Layer & l, const Darknet::NetworkState & state)
+	{
+		return !state.train
+			&& l.activation == SWISH
+			&& !env_flag_is_set("DARKNET_DISABLE_ADD_BIAS_SWISH_FUSION");
+	}
+
+	static bool should_use_small_1x1_linear_forward(const Darknet::Layer & l, const Darknet::NetworkState & state)
+	{
+		return !state.train
+			&& l.batch == 1
+			&& l.size == 1
+			&& l.stride_x == 1
+			&& l.stride_y == 1
+			&& l.dilation == 1
+			&& l.groups == 1
+			&& l.n > 0
+			&& l.n <= 16
+			&& l.c <= 512
+			&& l.activation == LINEAR
+			&& l.batch_normalize == 0
+			&& !l.binary
+			&& !l.xnor
+			&& !l.antialiasing
+			&& !l.coordconv
+			&& !l.assisted_excitation
+			&& env_flag_is_set("DARKNET_ENABLE_SMALL_1X1_LINEAR")
+			&& !env_flag_is_set("DARKNET_DISABLE_SMALL_1X1_LINEAR");
+	}
+
+	static bool should_use_direct_grouped_conv_forward(const Darknet::Layer & l, const Darknet::NetworkState & state)
+	{
+		const int in_per_group = l.groups > 0 ? l.c / l.groups : 0;
+		const int out_per_group = l.groups > 0 ? l.n / l.groups : 0;
+		const bool use_direct_1x1 = l.size == 1
+			&& !env_flag_is_set("DARKNET_DISABLE_DIRECT_GROUPED_1X1");
+		const bool use_direct_3x3 = l.size == 3
+			&& !env_flag_is_set("DARKNET_DISABLE_DIRECT_GROUPED_3X3");
+		return !state.train
+			&& l.batch == 1
+			&& l.groups > 1
+			&& l.groups <= 8
+			&& l.c % l.groups == 0
+			&& l.n % l.groups == 0
+			&& in_per_group > 0
+			&& in_per_group <= 32
+			&& out_per_group > 0
+			&& out_per_group <= 32
+			&& (use_direct_1x1 || use_direct_3x3)
+			&& l.stride_x == 1
+			&& l.stride_y == 1
+			&& l.dilation == 1
+			&& l.batch_normalize == 0
+			&& !l.binary
+			&& !l.xnor
+			&& !l.antialiasing
+			&& !l.coordconv
+			&& !l.assisted_excitation
+			&& (l.activation == LINEAR || l.activation == SWISH)
+			&& l.weights_gpu != nullptr
+			&& l.biases_gpu != nullptr
+			&& !env_flag_is_set("DARKNET_DISABLE_DIRECT_GROUPED_CONV");
+	}
+
+	static bool should_use_fused_route_1x1_forward(const Darknet::Layer & l, const Darknet::NetworkState & state)
+	{
+		return !state.train
+			&& l.batch == 1
+			&& l.inference_fused_route_input_count > 1
+			&& l.inference_fused_route_input_sizes_gpu != nullptr
+			&& l.inference_fused_route_layers_output_gpu != nullptr
+			&& l.size == 1
+			&& l.stride_x == 1
+			&& l.stride_y == 1
+			&& l.dilation == 1
+			&& l.groups == 1
+			&& l.batch_normalize == 0
+			&& !l.binary
+			&& !l.xnor
+			&& !l.antialiasing
+			&& !l.coordconv
+			&& !l.assisted_excitation
+			&& (l.activation == LINEAR || l.activation == SWISH)
+			&& l.weights_gpu != nullptr
+			&& l.biases_gpu != nullptr
+			&& !env_flag_is_set("DARKNET_DISABLE_ROUTE_1X1_FUSION");
+	}
 }
 
 
@@ -178,6 +329,241 @@ half *cuda_make_f16_from_f32_array(float *src, size_t n)
 	return dst16;
 }
 
+__global__ void small_1x1_linear_kernel(const float *input, const float *weights, const float *biases, float *output, const int spatial, const int in_channels, const int out_channels)
+{
+	const int index = blockIdx.x * blockDim.x + threadIdx.x;
+	const int total = spatial * out_channels;
+	if (index >= total)
+	{
+		return;
+	}
+
+	const int spatial_index = index % spatial;
+	const int out_channel = index / spatial;
+	float sum = biases ? biases[out_channel] : 0.0f;
+	const float *weight = weights + out_channel * in_channels;
+	for (int in_channel = 0; in_channel < in_channels; ++in_channel)
+	{
+		sum += weight[in_channel] * input[in_channel * spatial + spatial_index];
+	}
+	output[index] = sum;
+}
+
+static void small_1x1_linear_gpu(const Darknet::Layer & l, const float *input, float *output)
+{
+	const int spatial = l.out_w * l.out_h;
+	const int total = spatial * l.n;
+	small_1x1_linear_kernel <<< get_number_of_blocks(total, BLOCK), BLOCK, 0, get_cuda_stream() >>> (input, l.weights_gpu, l.biases_gpu, output, spatial, l.c, l.n);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+__global__ void direct_grouped_1x1_kernel(
+	const float *input,
+	const float *weights,
+	const float *biases,
+	float *output,
+	const int spatial,
+	const int in_per_group,
+	const int out_per_group,
+	const int groups,
+	const int swish_activation)
+{
+	const int index = blockIdx.x * blockDim.x + threadIdx.x;
+	const int total = spatial * out_per_group * groups;
+	if (index >= total)
+	{
+		return;
+	}
+
+	const int spatial_index = index % spatial;
+	const int out_channel = index / spatial;
+	const int group = out_channel / out_per_group;
+	const int out_channel_in_group = out_channel - group * out_per_group;
+	const int input_channel_offset = group * in_per_group;
+	const int weight_offset = (group * out_per_group + out_channel_in_group) * in_per_group;
+	float sum = biases[out_channel];
+
+	for (int in_channel = 0; in_channel < in_per_group; ++in_channel)
+	{
+		sum += weights[weight_offset + in_channel] * input[(input_channel_offset + in_channel) * spatial + spatial_index];
+	}
+
+	if (swish_activation)
+	{
+		const float sigmoid = 1.0f / (1.0f + expf(-sum));
+		sum *= sigmoid;
+	}
+	output[index] = sum;
+}
+
+__global__ void direct_grouped_3x3_kernel(
+	const float *input,
+	const float *weights,
+	const float *biases,
+	float *output,
+	const int in_w,
+	const int in_h,
+	const int out_w,
+	const int out_h,
+	const int in_per_group,
+	const int out_per_group,
+	const int groups,
+	const int pad,
+	const int swish_activation)
+{
+	const int spatial = out_w * out_h;
+	const int index = blockIdx.x * blockDim.x + threadIdx.x;
+	const int total = spatial * out_per_group * groups;
+	if (index >= total)
+	{
+		return;
+	}
+
+	const int spatial_index = index % spatial;
+	const int out_x = spatial_index % out_w;
+	const int out_y = spatial_index / out_w;
+	const int out_channel = index / spatial;
+	const int group = out_channel / out_per_group;
+	const int out_channel_in_group = out_channel - group * out_per_group;
+	const int input_channel_offset = group * in_per_group;
+	const int weight_base = (group * out_per_group + out_channel_in_group) * in_per_group * 9;
+	const int input_spatial = in_w * in_h;
+	float sum = biases[out_channel];
+
+	for (int in_channel = 0; in_channel < in_per_group; ++in_channel)
+	{
+		const float *input_channel = input + (input_channel_offset + in_channel) * input_spatial;
+		const float *weight_channel = weights + weight_base + in_channel * 9;
+		#pragma unroll
+		for (int ky = 0; ky < 3; ++ky)
+		{
+			const int input_y = out_y + ky - pad;
+			if (input_y < 0 || input_y >= in_h)
+			{
+				continue;
+			}
+			#pragma unroll
+			for (int kx = 0; kx < 3; ++kx)
+			{
+				const int input_x = out_x + kx - pad;
+				if (input_x < 0 || input_x >= in_w)
+				{
+					continue;
+				}
+				sum += weight_channel[ky * 3 + kx] * input_channel[input_y * in_w + input_x];
+			}
+		}
+	}
+
+	if (swish_activation)
+	{
+		const float sigmoid = 1.0f / (1.0f + expf(-sum));
+		sum *= sigmoid;
+	}
+	output[index] = sum;
+}
+
+static void direct_grouped_conv_gpu(const Darknet::Layer & l, const float *input, float *output)
+{
+	const int in_per_group = l.c / l.groups;
+	const int out_per_group = l.n / l.groups;
+	const int total = l.out_w * l.out_h * l.n;
+	const int swish_activation = l.activation == SWISH ? 1 : 0;
+	if (l.size == 1)
+	{
+		direct_grouped_1x1_kernel <<< get_number_of_blocks(total, BLOCK), BLOCK, 0, get_cuda_stream() >>> (
+			input,
+			l.weights_gpu,
+			l.biases_gpu,
+			output,
+			l.out_w * l.out_h,
+			in_per_group,
+			out_per_group,
+			l.groups,
+			swish_activation);
+	}
+	else
+	{
+		direct_grouped_3x3_kernel <<< get_number_of_blocks(total, BLOCK), BLOCK, 0, get_cuda_stream() >>> (
+			input,
+			l.weights_gpu,
+			l.biases_gpu,
+			output,
+			l.w,
+			l.h,
+			l.out_w,
+			l.out_h,
+			in_per_group,
+			out_per_group,
+			l.groups,
+			l.pad,
+			swish_activation);
+	}
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+__global__ void fused_route_1x1_kernel(
+	float **inputs,
+	const int *input_sizes,
+	const int input_count,
+	const float *weights,
+	const float *biases,
+	float *output,
+	const int spatial,
+	const int in_channels,
+	const int out_channels,
+	const int swish_activation)
+{
+	const int index = blockIdx.x * blockDim.x + threadIdx.x;
+	const int total = spatial * out_channels;
+	if (index >= total)
+	{
+		return;
+	}
+
+	const int spatial_index = index % spatial;
+	const int out_channel = index / spatial;
+	const float *weight = weights + out_channel * in_channels;
+	float sum = biases[out_channel];
+	int channel_offset = 0;
+	for (int input_idx = 0; input_idx < input_count; ++input_idx)
+	{
+		const int channels = input_sizes[input_idx] / spatial;
+		const float *input = inputs[input_idx];
+		for (int channel = 0; channel < channels; ++channel)
+		{
+			sum += weight[channel_offset + channel] * input[channel * spatial + spatial_index];
+		}
+		channel_offset += channels;
+	}
+
+	if (swish_activation)
+	{
+		const float sigmoid = 1.0f / (1.0f + expf(-sum));
+		sum *= sigmoid;
+	}
+	output[index] = sum;
+}
+
+static void fused_route_1x1_gpu(const Darknet::Layer & l, float *output)
+{
+	const int spatial = l.out_w * l.out_h;
+	const int total = spatial * l.n;
+	const int swish_activation = l.activation == SWISH ? 1 : 0;
+	fused_route_1x1_kernel <<< get_number_of_blocks(total, BLOCK), BLOCK, 0, get_cuda_stream() >>> (
+		l.inference_fused_route_layers_output_gpu,
+		l.inference_fused_route_input_sizes_gpu,
+		l.inference_fused_route_input_count,
+		l.weights_gpu,
+		l.biases_gpu,
+		output,
+		spatial,
+		l.c,
+		l.n,
+		swish_activation);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
 void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state)
 {
 	TAT(TATPARMS);
@@ -270,15 +656,49 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 
 	//fill_ongpu(l.outputs*l.batch, 0, l.output_gpu, 1);
 
-#ifdef CUDNN
-	//float one = 1;    // alpha[0], beta[0] is float for HALF and FLOAT
-	float alpha = 1, beta = 0;
+	if (should_use_fused_route_1x1_forward(l, state))
+	{
+		fused_route_1x1_gpu(l, l.output_gpu);
+		if (state.net.try_fix_nan)
+		{
+			fix_nan_and_inf(l.output_gpu, l.outputs*l.batch);
+		}
+		return;
+	}
+
+	if (should_use_direct_grouped_conv_forward(l, state))
+	{
+		direct_grouped_conv_gpu(l, state.input, l.output_gpu);
+		if (state.net.try_fix_nan)
+		{
+			fix_nan_and_inf(l.output_gpu, l.outputs*l.batch);
+		}
+		return;
+	}
+
+	if (should_use_small_1x1_linear_forward(l, state))
+	{
+		small_1x1_linear_gpu(l, state.input, l.output_gpu);
+		if (state.net.try_fix_nan)
+		{
+			fix_nan_and_inf(l.output_gpu, l.outputs*l.batch);
+		}
+		return;
+	}
+
+	#ifdef CUDNN
+		//float one = 1;    // alpha[0], beta[0] is float for HALF and FLOAT
+		float alpha = 1, beta = 0;
+	bool activation_completed = false;
 
 //#ifdef CUDNN_HALF
 	//if (state.use_mixed_precision) {
 	int iteration_num = get_current_iteration(state.net); // (*state.net.seen) / (state.net.batch*state.net.subdivisions);
-	if (state.index != 0 && state.net.cudnn_half && !l.xnor && (!state.train || (iteration_num > 3 * state.net.burn_in) && state.net.loss_scale != 1) &&
-		(l.c / l.groups) % 8 == 0 && l.n % 8 == 0 && l.groups <= 1 && l.size > 1)
+	const bool optional_fast_1x1_half = is_optional_fast_1x1_half_conv(l, state);
+	const bool optional_fast_grouped_half = is_optional_fast_grouped_half_conv(l, state);
+	const bool optional_fast_half = optional_fast_1x1_half || optional_fast_grouped_half;
+	bool half_path_completed = false;
+	if (should_use_cudnn_half_forward(l, state, iteration_num))
 	{
 		// Note: For improved performance it is advised to use beta[0] = 0.0.
 		// For Tensor Core: cudnnSetConvolutionMathType() where cudnnMathType_t mathType = CUDNN_TENSOR_OP_MATH;
@@ -309,7 +729,7 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 		assert(input16_size > 0);
 		cuda_convert_f32_to_f16(state.input, input16_size, input16);
 
-		CHECK_CUDNN(cudnnConvolutionForward(cudnn_handle(),
+		const cudnnStatus_t status = cudnnConvolutionForward(cudnn_handle(),
 			&alpha,
 			l.srcTensorDesc16,
 			input16,
@@ -321,54 +741,80 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 			l.workspace_size,
 			&beta,
 			l.dstTensorDesc16,
-			output16));
+			output16);
 
-
-		if (l.batch_normalize)
+		if (status != CUDNN_STATUS_SUCCESS)
 		{
-			if (state.train && !state.net.adversarial) // Training
+			if (!optional_fast_half)
 			{
-				simple_copy_ongpu(l.outputs*l.batch / 2, output16, l.x_gpu);
-				float one = 1.0f;
-				float zero = 0.0f;
-				// Batch-normalization can still take FP16 inputs and outputs, saving half the bandwidth
-				// compared to FP32, it's just that the statistics and value adjustment should be done in FP32.
-				CHECK_CUDNN(cudnnBatchNormalizationForwardTraining(cudnn_handle(),
-					CUDNN_BATCHNORM_SPATIAL,
-					&one,
-					&zero,
-					l.normDstTensorDescF16,
-					l.x_gpu,            // input
-					l.normDstTensorDescF16,
-					output16,            // output
-					l.normTensorDesc,
-					l.scales_gpu,       // input
-					l.biases_gpu,       // input
-					.01,
-					l.rolling_mean_gpu,        // input/output (should be FP32)
-					l.rolling_variance_gpu,    // input/output (should be FP32)
-					.00001,
-					l.mean_gpu,            // output (should be FP32) - optional cache to speedup cudnnBatchNormalizationBackward()
-					l.variance_gpu));    // output (should be FP32) - optional cache to speedup cudnnBatchNormalizationBackward()
-
-				cuda_convert_f16_to_f32(output16, output16_size, l.output_gpu);
-				//forward_batchnorm_layer_gpu(l, state);
+				CHECK_CUDNN(status);
 			}
-			else // Detection
+			else if (cfg_and_state.is_verbose)
 			{
-				cuda_convert_f16_to_f32(output16, output16_size, l.output_gpu);
-				normalize_gpu(l.output_gpu, l.rolling_mean_gpu, l.rolling_variance_gpu, l.batch, l.out_c, l.out_h*l.out_w);
-				scale_bias_gpu(l.output_gpu, l.scales_gpu, l.batch, l.out_c, l.out_h*l.out_w);
-				add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.out_c, l.out_w*l.out_h);
+				*cfg_and_state.output
+					<< "optional half conv rejected by cuDNN at layer " << state.index
+					<< ": " << cudnnGetErrorString(status)
+					<< "; falling back to float cuDNN" << std::endl;
 			}
 		}
-		else // BIAS only
+		else
 		{
-			cuda_convert_f16_to_f32(output16, output16_size, l.output_gpu);
-			add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+			half_path_completed = true;
+
+			if (l.batch_normalize)
+			{
+				if (state.train && !state.net.adversarial) // Training
+				{
+					simple_copy_ongpu(l.outputs*l.batch / 2, output16, l.x_gpu);
+					float one = 1.0f;
+					float zero = 0.0f;
+					// Batch-normalization can still take FP16 inputs and outputs, saving half the bandwidth
+					// compared to FP32, it's just that the statistics and value adjustment should be done in FP32.
+					CHECK_CUDNN(cudnnBatchNormalizationForwardTraining(cudnn_handle(),
+						CUDNN_BATCHNORM_SPATIAL,
+						&one,
+						&zero,
+						l.normDstTensorDescF16,
+						l.x_gpu,            // input
+						l.normDstTensorDescF16,
+						output16,            // output
+						l.normTensorDesc,
+						l.scales_gpu,       // input
+						l.biases_gpu,       // input
+						.01,
+						l.rolling_mean_gpu,        // input/output (should be FP32)
+						l.rolling_variance_gpu,    // input/output (should be FP32)
+						.00001,
+						l.mean_gpu,            // output (should be FP32) - optional cache to speedup cudnnBatchNormalizationBackward()
+						l.variance_gpu));    // output (should be FP32) - optional cache to speedup cudnnBatchNormalizationBackward()
+
+					cuda_convert_f16_to_f32(output16, output16_size, l.output_gpu);
+					//forward_batchnorm_layer_gpu(l, state);
+				}
+				else // Detection
+				{
+					cuda_convert_f16_to_f32(output16, output16_size, l.output_gpu);
+					normalize_gpu(l.output_gpu, l.rolling_mean_gpu, l.rolling_variance_gpu, l.batch, l.out_c, l.out_h*l.out_w);
+					scale_bias_gpu(l.output_gpu, l.scales_gpu, l.batch, l.out_c, l.out_h*l.out_w);
+					add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.out_c, l.out_w*l.out_h);
+				}
+			}
+			else // BIAS only
+			{
+				cuda_convert_f16_to_f32(output16, output16_size, l.output_gpu);
+				if (should_fuse_add_bias_swish(l, state))
+				{
+					add_bias_swish_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+					activation_completed = true;
+				}
+				else
+				{
+					add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+				}
+			}
 		}
 	}
-	else
+	if (!half_path_completed)
 	{
 		CHECK_CUDNN(cudnnConvolutionForward(cudnn_handle(),
 			&alpha, //&one,
@@ -389,7 +835,15 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 			forward_batchnorm_layer_gpu(l, state);
 		}
 		else {
-			add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+			if (should_fuse_add_bias_swish(l, state))
+			{
+				add_bias_swish_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+				activation_completed = true;
+			}
+			else
+			{
+				add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+			}
 		}
 	//#endif    // CUDNN_HALF
 	}
@@ -441,20 +895,31 @@ void forward_convolutional_layer_gpu(Darknet::Layer & l, Darknet::NetworkState s
 	}
 	else
 	{
-		add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+		if (should_fuse_add_bias_swish(l, state))
+		{
+			add_bias_swish_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+			activation_completed = true;
+		}
+		else
+		{
+			add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+		}
 	}
 #endif
 
 //#ifndef CUDNN_HALF
 //#endif // no CUDNN_HALF
 
-	if (l.activation == SWISH) activate_array_swish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
-	else if (l.activation == MISH) activate_array_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
-	else if (l.activation == HARD_MISH) activate_array_hard_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
-	else if (l.activation == NORM_CHAN) activate_array_normalize_channels_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu);
-	else if (l.activation == NORM_CHAN_SOFTMAX) activate_array_normalize_channels_softmax_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu, 0);
-	else if (l.activation == NORM_CHAN_SOFTMAX_MAXVAL) activate_array_normalize_channels_softmax_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu, 1);
-	else if (l.activation != LINEAR) activate_array_ongpu(l.output_gpu, l.outputs*l.batch, l.activation);
+	if (!activation_completed)
+	{
+		if (l.activation == SWISH) activate_array_swish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
+		else if (l.activation == MISH) activate_array_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
+		else if (l.activation == HARD_MISH) activate_array_hard_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
+		else if (l.activation == NORM_CHAN) activate_array_normalize_channels_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu);
+		else if (l.activation == NORM_CHAN_SOFTMAX) activate_array_normalize_channels_softmax_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu, 0);
+		else if (l.activation == NORM_CHAN_SOFTMAX_MAXVAL) activate_array_normalize_channels_softmax_ongpu(l.output_gpu, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output_gpu, 1);
+		else if (l.activation != LINEAR) activate_array_ongpu(l.output_gpu, l.outputs*l.batch, l.activation);
+	}
 	//if(l.dot > 0) dot_error_gpu(l);
 	if(l.binary || l.xnor) swap_binary(&l);
 	//cudaDeviceSynchronize();    // for correct profiling of performance

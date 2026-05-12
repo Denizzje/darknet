@@ -166,6 +166,18 @@ namespace Darknet
 			float *output;
 			learning_rate_policy policy;
 			int benchmark_layers;
+			int inference_optimized;
+			int inference_optimizer_skipped_layers;
+			int inference_optimizer_fused_repconvn;
+			int inference_optimizer_aliased_routes;
+			int inference_optimizer_pruned_layers;
+			int inference_optimizer_fused_route_1x1;
+			int inference_optimizer_direct_yolov9_heads;
+			int inference_optimizer_disabled_cudnn_half;
+			int inference_cuda_graph_enabled;
+			int inference_cuda_graph_captured;
+			int inference_cuda_graph_launches;
+			void *inference_cuda_graph_mutex;
 			int *total_bbox;
 			int *rewritten_bbox;
 
@@ -333,6 +345,10 @@ int64_t get_current_iteration(const Darknet::Network & net);
 void forward_network(Darknet::Network & net, Darknet::NetworkState state);
 void backward_network(Darknet::Network & net, Darknet::NetworkState state);
 void update_network(Darknet::Network & net);
+void optimize_network_for_inference(Darknet::Network & net);
+int inference_optimizer_is_disabled();
+int resolve_inference_layer_index(const Darknet::Network & net, int layer_index);
+int resolve_inference_layer_output_offset(const Darknet::Network & net, int layer_index);
 
 float train_network(Darknet::Network & net, data d);
 float train_network_waitkey(Darknet::Network & net, data d, int wait_key);

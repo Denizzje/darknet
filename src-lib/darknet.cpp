@@ -45,6 +45,7 @@ std::string get_windows_version()
 namespace
 {
 	static auto & cfg_and_state = Darknet::CfgAndState::get();
+	thread_local Darknet::PredictionTiming latest_timing;
 
 	// remember that OpenCV colours are BGR, not RGB
 	static const auto white = cv::Scalar(255, 255, 255);
@@ -1373,6 +1374,12 @@ void Darknet::network_dimensions(Darknet::NetworkPtr & ptr, int & w, int & h, in
 }
 
 
+Darknet::PredictionTiming Darknet::latest_prediction_timing()
+{
+	return latest_timing;
+}
+
+
 Darknet::Predictions Darknet::predict(const Darknet::NetworkPtr ptr, const cv::Mat & mat)
 {
 	TAT(TATPARMS);
@@ -1427,6 +1434,7 @@ Darknet::Predictions Darknet::predict(const Darknet::NetworkPtr ptr, const cv::M
 Darknet::Predictions Darknet::predict(Darknet::NetworkPtr ptr, Darknet::Image & img, cv::Size original_image_size)
 {
 	TAT(TATPARMS);
+	latest_timing = {};
 
 	Darknet::Network * net = reinterpret_cast<Darknet::Network *>(ptr);
 	if (net == nullptr)
@@ -1439,19 +1447,29 @@ Darknet::Predictions Darknet::predict(Darknet::NetworkPtr ptr, Darknet::Image & 
 	if (original_image_size.width	< 1) original_image_size.width	= img.w;
 	if (original_image_size.height	< 1) original_image_size.height	= img.h;
 
+	const auto network_begin = std::chrono::high_resolution_clock::now();
 	network_predict(*net, img.data); /// @todo pass net by ref or pointer, not copy constructor!
+	const auto network_end = std::chrono::high_resolution_clock::now();
 	Darknet::free_image(img);
+	latest_timing.network_forward_ms = std::chrono::duration<double, std::milli>(network_end - network_begin).count();
 
 	int nboxes = 0;
 	const float hierarchy_threshold = 0.5f;
+	const auto postprocess_begin = std::chrono::high_resolution_clock::now();
 	auto darknet_results = get_network_boxes(net, img.w, img.h, net->details->detection_threshold, hierarchy_threshold, 0, 1, &nboxes, 0);
+	const auto postprocess_end = std::chrono::high_resolution_clock::now();
+	latest_timing.postprocess_ms = std::chrono::duration<double, std::milli>(postprocess_end - postprocess_begin).count();
 
 	if (net->details->non_maximal_suppression_threshold)
 	{
 		auto & layer = net->layers[net->n - 1];
+		const auto nms_begin = std::chrono::high_resolution_clock::now();
 		do_nms_sort(darknet_results, nboxes, layer.classes, net->details->non_maximal_suppression_threshold);
+		const auto nms_end = std::chrono::high_resolution_clock::now();
+		latest_timing.nms_ms = std::chrono::duration<double, std::milli>(nms_end - nms_begin).count();
 	}
 
+	const auto conversion_begin = std::chrono::high_resolution_clock::now();
 	Predictions predictions;
 	predictions.reserve(nboxes); // this is likely too many (depends on the detection threshold) but gets us in the ballpark
 
@@ -1511,6 +1529,8 @@ Darknet::Predictions Darknet::predict(Darknet::NetworkPtr ptr, Darknet::Image & 
 	}
 
 	free_detections(darknet_results, nboxes);
+	const auto conversion_end = std::chrono::high_resolution_clock::now();
+	latest_timing.conversion_ms = std::chrono::duration<double, std::milli>(conversion_end - conversion_begin).count();
 
 	return predictions;
 }

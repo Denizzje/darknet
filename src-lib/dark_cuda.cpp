@@ -299,7 +299,10 @@ cudaStream_t switch_stream(int i)
 	{
 		CHECK_CUDA(cudaStreamCreateWithFlags(&switchStreamsArray[i], cudaStreamNonBlocking));
 		switchStreamInit[i] = 1;
-		*cfg_and_state.output << "Create CUDA stream #" << i << std::endl;
+		if (cfg_and_state.is_verbose)
+		{
+			*cfg_and_state.output << "Create CUDA stream #" << i << std::endl;
+		}
 	}
 
 	streamsArray[dev_id] = switchStreamsArray[i];
@@ -310,7 +313,10 @@ cudaStream_t switch_stream(int i)
 		CHECK_CUDNN( cudnnCreate(&switchCudnnHandle[i]) );
 		switchCudnnInit[i] = 1;
 		CHECK_CUDNN(cudnnSetStream(switchCudnnHandle[i], switchStreamsArray[i]));
-		*cfg_and_state.output << "Create cuDNN handle #" << i << std::endl;
+		if (cfg_and_state.is_verbose)
+		{
+			*cfg_and_state.output << "Create cuDNN handle #" << i << std::endl;
+		}
 	}
 	cudnnHandle[dev_id] = switchCudnnHandle[i];
 	cudnnInit[dev_id] = switchCudnnInit[i];

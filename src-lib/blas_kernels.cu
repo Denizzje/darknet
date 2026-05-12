@@ -92,6 +92,17 @@ __global__ void add_bias_kernel(float *output, float *biases, int batch, int fil
 	output[index] += biases[f];
 }
 
+__global__ void add_bias_swish_kernel(float *output, float *biases, int batch, int filters, int spatial, int current_size)
+{
+	const int index = blockIdx.x*blockDim.x + threadIdx.x;
+	if (index >= current_size) return;
+
+	const int f = (index / spatial) % filters;
+	const float value = output[index] + biases[f];
+	const float sigmoid = 1.0f / (1.0f + expf(-value));
+	output[index] = value * sigmoid;
+}
+
 void add_bias_gpu(float *output, float *biases, int batch, int filters, int spatial)
 {
 	TAT(TATPARMS);
@@ -100,6 +111,17 @@ void add_bias_gpu(float *output, float *biases, int batch, int filters, int spat
 	const int num_blocks = get_number_of_blocks(current_size, BLOCK);
 
 	add_bias_kernel <<<num_blocks, BLOCK, 0, get_cuda_stream() >>>(output, biases, batch, filters, spatial, current_size);
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+void add_bias_swish_gpu(float *output, float *biases, int batch, int filters, int spatial)
+{
+	TAT(TATPARMS);
+
+	const int current_size = batch * filters * spatial;
+	const int num_blocks = get_number_of_blocks(current_size, BLOCK);
+
+	add_bias_swish_kernel <<<num_blocks, BLOCK, 0, get_cuda_stream() >>>(output, biases, batch, filters, spatial, current_size);
 	CHECK_CUDA(cudaPeekAtLastError());
 }
 
@@ -942,6 +964,29 @@ __global__ void shortcut_singlelayer_simple_kernel(int size, int src_outputs, in
 	out[id] = out_val;
 }
 
+__global__ void shortcut_singlelayer_swish_kernel(int size, int src_outputs, int batch, int *outputs_of_layers_gpu, float **layers_output_gpu, float *out, float *in)
+{
+	const int id = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
+	if (id >= size) return;
+
+	int src_id = id;
+	const int src_i = src_id % src_outputs;
+	src_id /= src_outputs;
+	const int src_b = src_id;
+
+	float out_val = in[id];
+	const int add_outputs = outputs_of_layers_gpu[0];
+	if (src_i < add_outputs)
+	{
+		const int add_index = add_outputs*src_b + src_i;
+		float *add = layers_output_gpu[0];
+		out_val += add[add_index];
+	}
+
+	const float sigmoid = 1.0f / (1.0f + expf(-out_val));
+	out[id] = out_val * sigmoid;
+}
+
 __global__ void shortcut_multilayer_kernel(int size, int src_outputs, int batch, int n, int *outputs_of_layers_gpu, float **layers_output_gpu, float *out, float *in, float *weights_gpu, int nweights, WEIGHTS_NORMALIZATION_T weights_normalization)
 {
 	const int id = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
@@ -1020,6 +1065,15 @@ void shortcut_multilayer_gpu(int src_outputs, int batch, int n, int *outputs_of_
 	else {
 		shortcut_multilayer_kernel <<<cuda_gridsize(size), BLOCK, 0, get_cuda_stream() >>> (size, src_outputs, batch, n, outputs_of_layers_gpu, layers_output_gpu, out, in, weights_gpu, nweights, weights_normalization);
 	}
+	CHECK_CUDA(cudaPeekAtLastError());
+}
+
+void shortcut_singlelayer_swish_gpu(int src_outputs, int batch, int *outputs_of_layers_gpu, float **layers_output_gpu, float *out, float *in)
+{
+	TAT(TATPARMS);
+
+	const int size = batch * src_outputs;
+	shortcut_singlelayer_swish_kernel <<<cuda_gridsize(size), BLOCK, 0, get_cuda_stream() >>> (size, src_outputs, batch, outputs_of_layers_gpu, layers_output_gpu, out, in);
 	CHECK_CUDA(cudaPeekAtLastError());
 }
 

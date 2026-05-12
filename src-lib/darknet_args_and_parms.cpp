@@ -127,6 +127,7 @@ const Darknet::SArgsAndParms & Darknet::get_all_possible_arguments()
 		ArgsAndParms("denormalize"	, ArgsAndParms::EType::kCommand	, ""),
 		ArgsAndParms("detect"		, ArgsAndParms::EType::kCommand	, ""),
 		ArgsAndParms("detector"		, ArgsAndParms::EType::kCommand	, "Train or check neural networks."),
+		ArgsAndParms("dumpyolov9"	, ArgsAndParms::EType::kCommand	, "Dump YOLOv9 head input logits for parity fixtures."),
 		ArgsAndParms("help"			, ArgsAndParms::EType::kCommand	, "Display usage information."),
 		ArgsAndParms("imtest"		, ArgsAndParms::EType::kCommand	, ""),
 		ArgsAndParms("map"			, ArgsAndParms::EType::kFunction, "Calculate mean average precision for a given dataset."),

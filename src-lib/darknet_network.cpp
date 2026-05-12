@@ -4,6 +4,659 @@
 namespace
 {
 	static auto & cfg_and_state = Darknet::CfgAndState::get();
+
+	bool is_repconvn_conv(const Darknet::Layer & l, const int size)
+	{
+		return l.type == Darknet::ELayerType::CONVOLUTIONAL
+			and l.size == size
+			and l.stride_x == 1
+			and l.stride_y == 1
+			and l.dilation == 1
+			and l.activation == LINEAR
+			and l.batch_normalize == 0
+			and l.groups > 0
+			and l.weights != nullptr
+			and l.biases != nullptr;
+	}
+
+	bool is_inference_optimizer_disabled()
+	{
+		const char * env = std::getenv("DARKNET_DISABLE_INFERENCE_OPTIMIZER");
+		return env != nullptr and env[0] != '\0' and std::string(env) != "0";
+	}
+
+	bool env_flag_is_set(const char * name)
+	{
+		const char * env = std::getenv(name);
+		return env != nullptr and env[0] != '\0' and std::string(env) != "0";
+	}
+
+	bool is_inference_cuda_graph_disabled()
+	{
+		return env_flag_is_set("DARKNET_DISABLE_INFERENCE_CUDA_GRAPH")
+			or env_flag_is_set("DARKNET_DISABLE_CUDA_GRAPH")
+			or env_flag_is_set("DARKNET_YOLOV9_PACK_INFERENCE_OUTPUT")
+			or env_flag_is_set("DARKNET_YOLOV9_PULL_IN_FORWARD");
+	}
+
+	bool is_route_1x1_fusion_disabled()
+	{
+		return env_flag_is_set("DARKNET_DISABLE_ROUTE_1X1_FUSION")
+			or not env_flag_is_set("DARKNET_ENABLE_ROUTE_1X1_FUSION");
+	}
+
+	bool is_yolov9_direct_head_disabled()
+	{
+		return env_flag_is_set("DARKNET_DISABLE_YOLOV9_DIRECT_HEAD")
+			or not env_flag_is_set("DARKNET_ENABLE_YOLOV9_DIRECT_HEAD");
+	}
+
+	void mark_inference_alias(Darknet::Network & net, const int layer_index, const int alias_layer, const int output_offset = 0)
+	{
+		if (layer_index < 0 or layer_index >= net.n or alias_layer < 0 or alias_layer >= net.n or layer_index == alias_layer)
+		{
+			return;
+		}
+
+		Darknet::Layer & l = net.layers[layer_index];
+		if (not l.inference_skip)
+		{
+			net.inference_optimizer_skipped_layers += 1;
+		}
+		l.inference_skip = 1;
+		l.inference_alias_layer = alias_layer;
+		l.inference_alias_output_offset = output_offset;
+	}
+
+	bool repconvn_pattern_matches(const Darknet::Network & net, const int conv3_idx)
+	{
+		if (conv3_idx < 1 or conv3_idx + 3 >= net.n)
+		{
+			return false;
+		}
+
+		const Darknet::Layer & conv3 = net.layers[conv3_idx];
+		const Darknet::Layer & route = net.layers[conv3_idx + 1];
+		const Darknet::Layer & conv1 = net.layers[conv3_idx + 2];
+		const Darknet::Layer & shortcut = net.layers[conv3_idx + 3];
+
+		if (not is_repconvn_conv(conv3, 3) or not is_repconvn_conv(conv1, 1))
+		{
+			return false;
+		}
+		if (conv3.pad == 0)
+		{
+			return false;
+		}
+		if (conv3.n != conv1.n or conv3.c != conv1.c or conv3.groups != conv1.groups)
+		{
+			return false;
+		}
+		if (conv3.out_w != conv1.out_w or conv3.out_h != conv1.out_h or conv3.out_c != conv1.out_c)
+		{
+			return false;
+		}
+		if (route.type != Darknet::ELayerType::ROUTE or route.n != 1 or route.groups != 1)
+		{
+			return false;
+		}
+		if (route.input_layers == nullptr or route.input_layers[0] != conv3_idx - 1)
+		{
+			return false;
+		}
+		if (shortcut.type != Darknet::ELayerType::SHORTCUT or shortcut.n != 1 or shortcut.activation != SWISH)
+		{
+			return false;
+		}
+		if (shortcut.input_layers == nullptr or shortcut.input_layers[0] != conv3_idx)
+		{
+			return false;
+		}
+		if (shortcut.outputs != conv3.outputs or shortcut.outputs != conv1.outputs)
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	void ensure_inference_activation_buffer(Darknet::Layer & l)
+	{
+		if (l.activation != SWISH and l.activation != MISH and l.activation != HARD_MISH)
+		{
+			return;
+		}
+
+		const size_t elements = static_cast<size_t>(l.batch) * static_cast<size_t>(l.outputs);
+		if (l.activation_input == nullptr)
+		{
+			l.activation_input = static_cast<float *>(xcalloc(elements, sizeof(float)));
+		}
+
+#ifdef DARKNET_GPU
+		if (cfg_and_state.gpu_index >= 0 and l.activation_input_gpu == nullptr)
+		{
+			l.activation_input_gpu = cuda_make_array(l.activation_input, elements);
+		}
+#endif
+	}
+
+	void fuse_repconvn_block(Darknet::Network & net, const int conv3_idx)
+	{
+		Darknet::Layer & conv3 = net.layers[conv3_idx];
+		Darknet::Layer & conv1 = net.layers[conv3_idx + 2];
+
+		const int in_per_group = conv3.c / conv3.groups;
+		const int conv3_filter_size = conv3.size * conv3.size * in_per_group;
+		const int conv1_filter_size = conv1.size * conv1.size * in_per_group;
+		const int center = (conv3.size / 2) * conv3.size + (conv3.size / 2);
+
+		for (int filter = 0; filter < conv3.n; ++filter)
+		{
+			const int conv3_filter_offset = filter * conv3_filter_size;
+			const int conv1_filter_offset = filter * conv1_filter_size;
+			for (int channel = 0; channel < in_per_group; ++channel)
+			{
+				const int conv3_weight_index = conv3_filter_offset + channel * conv3.size * conv3.size + center;
+				const int conv1_weight_index = conv1_filter_offset + channel;
+				conv3.weights[conv3_weight_index] += conv1.weights[conv1_weight_index];
+			}
+			conv3.biases[filter] += conv1.biases[filter];
+		}
+
+		conv3.activation = SWISH;
+		ensure_inference_activation_buffer(conv3);
+
+#ifdef DARKNET_GPU
+		if (cfg_and_state.gpu_index >= 0 and conv3.weights_gpu != nullptr)
+		{
+			push_convolutional_layer(conv3);
+		}
+#endif
+
+		mark_inference_alias(net, conv3_idx + 1, conv3_idx - 1);
+		mark_inference_alias(net, conv3_idx + 2, conv3_idx);
+		mark_inference_alias(net, conv3_idx + 3, conv3_idx);
+		net.inference_optimizer_fused_repconvn += 1;
+	}
+
+	void remap_layer_input(Darknet::Network & net, Darknet::Layer & l, const int input_slot)
+	{
+		if (l.input_layers == nullptr)
+		{
+			return;
+		}
+
+		const int old_index = l.input_layers[input_slot];
+		const int new_index = resolve_inference_layer_index(net, old_index);
+		const int output_offset = resolve_inference_layer_output_offset(net, old_index);
+		if (new_index < 0 or new_index >= net.n)
+		{
+			return;
+		}
+		if (old_index >= 0
+			and old_index < net.n
+			and net.layers[old_index].inference_skip
+			and (output_offset != 0 or net.layers[old_index].outputs != net.layers[new_index].outputs))
+		{
+			return;
+		}
+		if (new_index == old_index)
+		{
+			return;
+		}
+
+		l.input_layers[input_slot] = new_index;
+		if (l.input_sizes != nullptr)
+		{
+			l.input_sizes[input_slot] = net.layers[new_index].outputs;
+		}
+	}
+
+	void refresh_shortcut_pointers(Darknet::Network & net, Darknet::Layer & l)
+	{
+		if (l.type != Darknet::ELayerType::SHORTCUT or l.input_layers == nullptr)
+		{
+			return;
+		}
+
+		for (int input = 0; input < l.n; ++input)
+		{
+			const int index = l.input_layers[input];
+			const int resolved_index = resolve_inference_layer_index(net, index);
+			const int output_offset = resolve_inference_layer_output_offset(net, index);
+			if (l.layers_output != nullptr)
+			{
+				l.layers_output[input] = net.layers[resolved_index].output + output_offset;
+			}
+			if (l.layers_delta != nullptr)
+			{
+				l.layers_delta[input] = net.layers[resolved_index].delta + output_offset;
+			}
+		}
+
+#ifdef DARKNET_GPU
+		if (cfg_and_state.gpu_index >= 0)
+		{
+			if (l.input_sizes_gpu != nullptr and l.input_sizes != nullptr)
+			{
+				memcpy_ongpu(l.input_sizes_gpu, l.input_sizes, l.n * sizeof(int));
+			}
+			if (l.layers_output_gpu != nullptr)
+			{
+				std::vector<float *> output_ptrs(l.n, nullptr);
+				for (int input = 0; input < l.n; ++input)
+				{
+					const int index = l.input_layers[input];
+					const int resolved_index = resolve_inference_layer_index(net, index);
+					const int output_offset = resolve_inference_layer_output_offset(net, index);
+					output_ptrs[input] = net.layers[resolved_index].output_gpu + output_offset;
+				}
+				memcpy_ongpu(l.layers_output_gpu, output_ptrs.data(), l.n * sizeof(float *));
+			}
+			if (l.layers_delta_gpu != nullptr)
+			{
+				std::vector<float *> delta_ptrs(l.n, nullptr);
+				for (int input = 0; input < l.n; ++input)
+				{
+					const int index = l.input_layers[input];
+					const int resolved_index = resolve_inference_layer_index(net, index);
+					const int output_offset = resolve_inference_layer_output_offset(net, index);
+					delta_ptrs[input] = net.layers[resolved_index].delta_gpu + output_offset;
+				}
+				memcpy_ongpu(l.layers_delta_gpu, delta_ptrs.data(), l.n * sizeof(float *));
+			}
+		}
+#endif
+	}
+
+	void remap_inference_alias_consumers(Darknet::Network & net)
+	{
+		for (int i = 0; i < net.n; ++i)
+		{
+			Darknet::Layer & l = net.layers[i];
+			if (l.input_layers != nullptr)
+			{
+				for (int input = 0; input < l.n; ++input)
+				{
+					remap_layer_input(net, l, input);
+				}
+				refresh_shortcut_pointers(net, l);
+			}
+		}
+	}
+
+	int count_inference_skipped_layers(const Darknet::Network & net)
+	{
+		int skipped = 0;
+		for (int i = 0; i < net.n; ++i)
+		{
+			if (net.layers[i].inference_skip)
+			{
+				skipped += 1;
+			}
+		}
+		return skipped;
+	}
+
+	std::vector<int> count_explicit_input_consumers(const Darknet::Network & net)
+	{
+		std::vector<int> consumers(net.n, 0);
+		for (int i = 0; i < net.n; ++i)
+		{
+			const Darknet::Layer & l = net.layers[i];
+			if (l.input_layers == nullptr)
+			{
+				continue;
+			}
+			for (int input = 0; input < l.n; ++input)
+			{
+				const int index = l.input_layers[input];
+				if (index >= 0 and index < net.n)
+				{
+					consumers[index] += 1;
+				}
+			}
+		}
+		return consumers;
+	}
+
+	bool can_fuse_route_concat_1x1(const Darknet::Network & net, const int conv_idx, const std::vector<int> & explicit_consumers)
+	{
+#ifndef DARKNET_GPU
+		return false;
+#else
+		if (is_route_1x1_fusion_disabled() or conv_idx <= 0 or conv_idx >= net.n)
+		{
+			return false;
+		}
+		if (cfg_and_state.gpu_index < 0)
+		{
+			return false;
+		}
+
+		const Darknet::Layer & route = net.layers[conv_idx - 1];
+		const Darknet::Layer & conv = net.layers[conv_idx];
+		if (route.inference_skip or route.type != Darknet::ELayerType::ROUTE or route.n <= 1 or route.groups != 1 or route.input_layers == nullptr or route.input_sizes == nullptr)
+		{
+			return false;
+		}
+		if (explicit_consumers[conv_idx - 1] != 0)
+		{
+			return false;
+		}
+		if (conv.type != Darknet::ELayerType::CONVOLUTIONAL or conv.batch != 1 or conv.size != 1 or conv.stride_x != 1 or conv.stride_y != 1 or conv.dilation != 1 or conv.groups != 1)
+		{
+			return false;
+		}
+		if (conv.batch_normalize != 0 or conv.weights_gpu == nullptr or conv.biases_gpu == nullptr)
+		{
+			return false;
+		}
+		if (conv.activation != LINEAR and conv.activation != SWISH)
+		{
+			return false;
+		}
+		if (route.out_w != conv.w or route.out_h != conv.h or route.out_c != conv.c or route.outputs != conv.inputs)
+		{
+			return false;
+		}
+		for (int input = 0; input < route.n; ++input)
+		{
+			const int index = route.input_layers[input];
+			if (index < 0 or index >= net.n)
+			{
+				return false;
+			}
+			const Darknet::Layer & from = net.layers[index];
+			if (from.out_w != route.out_w or from.out_h != route.out_h or from.outputs != route.input_sizes[input])
+			{
+				return false;
+			}
+		}
+		return true;
+#endif
+	}
+
+	void fuse_route_concat_1x1(Darknet::Network & net, const int conv_idx)
+	{
+		Darknet::Layer & route = net.layers[conv_idx - 1];
+		Darknet::Layer & conv = net.layers[conv_idx];
+		conv.inference_fused_route_layer = conv_idx - 1;
+		conv.inference_fused_route_input_count = route.n;
+		conv.inference_fused_route_input_sizes = static_cast<int *>(xcalloc(route.n, sizeof(int)));
+		conv.inference_fused_route_layers_output = static_cast<float **>(xcalloc(route.n, sizeof(float *)));
+
+		std::vector<float *> gpu_outputs(route.n, nullptr);
+		for (int input = 0; input < route.n; ++input)
+		{
+			const int source_index = route.input_layers[input];
+			const int resolved_index = resolve_inference_layer_index(net, source_index);
+			const int output_offset = resolve_inference_layer_output_offset(net, source_index);
+			conv.inference_fused_route_input_sizes[input] = route.input_sizes[input];
+			conv.inference_fused_route_layers_output[input] = net.layers[resolved_index].output + output_offset;
+#ifdef DARKNET_GPU
+			gpu_outputs[input] = net.layers[resolved_index].output_gpu + output_offset;
+#endif
+		}
+
+#ifdef DARKNET_GPU
+		if (cfg_and_state.gpu_index >= 0)
+		{
+			conv.inference_fused_route_input_sizes_gpu = cuda_make_int_array_new_api(conv.inference_fused_route_input_sizes, route.n);
+			conv.inference_fused_route_layers_output_gpu = reinterpret_cast<float **>(cuda_make_array_pointers(reinterpret_cast<void **>(gpu_outputs.data()), route.n));
+		}
+#endif
+
+		const int alias_index = resolve_inference_layer_index(net, route.input_layers[0]);
+		const int output_offset = resolve_inference_layer_output_offset(net, route.input_layers[0]);
+		mark_inference_alias(net, conv_idx - 1, alias_index, output_offset);
+		net.inference_optimizer_fused_route_1x1 += 1;
+	}
+
+	void fuse_route_concat_1x1_consumers(Darknet::Network & net)
+	{
+		const std::vector<int> explicit_consumers = count_explicit_input_consumers(net);
+		for (int i = 1; i < net.n; ++i)
+		{
+			if (can_fuse_route_concat_1x1(net, i, explicit_consumers))
+			{
+				fuse_route_concat_1x1(net, i);
+			}
+		}
+	}
+
+	bool yolov9_head_route_matches(const Darknet::Network & net, const Darknet::Layer & yolo, const int route_idx)
+	{
+		if (is_yolov9_direct_head_disabled() or route_idx < 0 or route_idx >= net.n)
+		{
+			return false;
+		}
+		const Darknet::Layer & route = net.layers[route_idx];
+		if (route.inference_skip or route.type != Darknet::ELayerType::ROUTE or route.n != 2 or route.groups != 1 or route.input_layers == nullptr)
+		{
+			return false;
+		}
+		const Darknet::Layer & box = net.layers[route.input_layers[0]];
+		const Darknet::Layer & cls = net.layers[route.input_layers[1]];
+		if (box.out_w != cls.out_w or box.out_h != cls.out_h)
+		{
+			return false;
+		}
+		if (box.out_c != 4 * yolo.reg_max or cls.out_c != yolo.classes)
+		{
+			return false;
+		}
+		return route.out_w == box.out_w
+			and route.out_h == box.out_h
+			and route.outputs == box.outputs + cls.outputs;
+	}
+
+	void mark_direct_yolov9_head_routes(Darknet::Network & net)
+	{
+		for (int i = 0; i < net.n; ++i)
+		{
+			Darknet::Layer & yolo = net.layers[i];
+			if (yolo.type != Darknet::ELayerType::YOLOV9 or yolo.input_layers == nullptr)
+			{
+				continue;
+			}
+			const int branch = std::max(0, std::min(yolo.inference_branch, yolo.branch_count - 1));
+			const int branch_offset = branch * yolo.n;
+			for (int scale = 0; scale < yolo.n; ++scale)
+			{
+				const int slot = branch_offset + scale;
+				if (slot < 0 or slot >= yolo.total)
+				{
+					continue;
+				}
+				const int route_idx = yolo.input_layers[slot];
+				if (not yolov9_head_route_matches(net, yolo, route_idx))
+				{
+					continue;
+				}
+				Darknet::Layer & route = net.layers[route_idx];
+				route.inference_direct_yolov9_head = 1;
+				const int alias_index = resolve_inference_layer_index(net, route.input_layers[0]);
+				const int output_offset = resolve_inference_layer_output_offset(net, route.input_layers[0]);
+				mark_inference_alias(net, route_idx, alias_index, output_offset);
+				net.inference_optimizer_direct_yolov9_heads += 1;
+			}
+		}
+	}
+
+	void maybe_log_inference_optimizer_summary(const Darknet::Network & net)
+	{
+		const char * verbose_env = std::getenv("DARKNET_INFERENCE_OPTIMIZER_VERBOSE");
+		const bool verbose_env_enabled = verbose_env != nullptr and verbose_env[0] != '\0' and std::string(verbose_env) != "0";
+		if (not cfg_and_state.is_verbose and not verbose_env_enabled)
+		{
+			return;
+		}
+
+		*cfg_and_state.output
+			<< "Darknet inference optimizer: fused " << net.inference_optimizer_fused_repconvn
+			<< " RepConvN blocks, aliased " << net.inference_optimizer_aliased_routes
+			<< " route layers, fused " << net.inference_optimizer_fused_route_1x1
+			<< " route->1x1 convs, direct " << net.inference_optimizer_direct_yolov9_heads
+			<< " YOLOv9 heads, disabled half inference " << net.inference_optimizer_disabled_cudnn_half
+			<< ", pruned " << net.inference_optimizer_pruned_layers
+			<< " branch layers, skipped " << net.inference_optimizer_skipped_layers
+			<< " of " << net.n << " layers." << std::endl;
+	}
+
+	bool has_multibranch_yolov9_output(const Darknet::Network & net)
+	{
+		for (int i = 0; i < net.n; ++i)
+		{
+			const Darknet::Layer & l = net.layers[i];
+			if (l.type == Darknet::ELayerType::YOLOV9 and l.branch_count > 1)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool has_yolov9_output(const Darknet::Network & net)
+	{
+		for (int i = 0; i < net.n; ++i)
+		{
+			if (net.layers[i].type == Darknet::ELayerType::YOLOV9)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void mark_inference_reachable_layer(const Darknet::Network & net, int layer_index, std::vector<unsigned char> & reachable)
+	{
+		layer_index = resolve_inference_layer_index(net, layer_index);
+		if (layer_index < 0 or layer_index >= net.n or reachable[layer_index])
+		{
+			return;
+		}
+
+		reachable[layer_index] = 1;
+		const Darknet::Layer & l = net.layers[layer_index];
+
+		if (l.type == Darknet::ELayerType::YOLOV9)
+		{
+			const int branch = std::max(0, std::min(l.inference_branch, l.branch_count - 1));
+			const int first_slot = branch * l.n;
+			const int last_slot = std::min(first_slot + l.n, l.total);
+			for (int slot = first_slot; slot < last_slot; ++slot)
+			{
+				if (l.input_layers != nullptr)
+				{
+					mark_inference_reachable_layer(net, l.input_layers[slot], reachable);
+				}
+			}
+			return;
+		}
+
+		if (l.type == Darknet::ELayerType::ROUTE)
+		{
+			for (int input = 0; input < l.n; ++input)
+			{
+				if (l.input_layers != nullptr)
+				{
+					mark_inference_reachable_layer(net, l.input_layers[input], reachable);
+				}
+			}
+			return;
+		}
+
+		if (l.type == Darknet::ELayerType::SHORTCUT)
+		{
+			mark_inference_reachable_layer(net, layer_index - 1, reachable);
+			for (int input = 0; input < l.n; ++input)
+			{
+				if (l.input_layers != nullptr)
+				{
+					mark_inference_reachable_layer(net, l.input_layers[input], reachable);
+				}
+			}
+			return;
+		}
+
+		if (layer_index > 0)
+		{
+			mark_inference_reachable_layer(net, layer_index - 1, reachable);
+		}
+	}
+
+	void prune_unreachable_yolov9_branches(Darknet::Network & net)
+	{
+		if (not has_multibranch_yolov9_output(net))
+		{
+			return;
+		}
+
+		std::vector<unsigned char> reachable(net.n, 0);
+		for (int i = net.n - 1; i >= 0; --i)
+		{
+			if (net.layers[i].type == Darknet::ELayerType::YOLOV9)
+			{
+				mark_inference_reachable_layer(net, i, reachable);
+			}
+		}
+
+		for (int i = 0; i < net.n; ++i)
+		{
+			if (reachable[i] or net.layers[i].inference_skip)
+			{
+				continue;
+			}
+			const int alias_index = resolve_inference_layer_index(net, i - 1);
+			if (alias_index >= 0 and alias_index < net.n)
+			{
+				mark_inference_alias(net, i, alias_index);
+				net.inference_optimizer_pruned_layers += 1;
+			}
+		}
+	}
+
+	void alias_single_input_routes(Darknet::Network & net)
+	{
+		for (int i = 0; i < net.n; ++i)
+		{
+			Darknet::Layer & l = net.layers[i];
+			if (l.inference_skip or l.type != Darknet::ELayerType::ROUTE or l.n != 1 or l.input_layers == nullptr)
+			{
+				continue;
+			}
+
+			const int input_index = l.input_layers[0];
+			const int alias_index = resolve_inference_layer_index(net, input_index);
+			if (alias_index < 0 or alias_index >= net.n)
+			{
+				continue;
+			}
+
+			const int base_offset = resolve_inference_layer_output_offset(net, input_index);
+			if (l.groups == 1)
+			{
+				mark_inference_alias(net, i, alias_index, base_offset);
+				net.inference_optimizer_aliased_routes += 1;
+				continue;
+			}
+
+			if (l.batch != 1 or l.groups <= 1 or l.group_id < 0 or l.group_id >= l.groups or l.input_sizes[0] % l.groups != 0)
+			{
+				continue;
+			}
+
+			const int part_input_size = l.input_sizes[0] / l.groups;
+			if (part_input_size != l.outputs)
+			{
+				continue;
+			}
+			mark_inference_alias(net, i, alias_index, base_offset + part_input_size * l.group_id);
+			net.inference_optimizer_aliased_routes += 1;
+		}
+	}
 }
 
 
@@ -238,6 +891,16 @@ void forward_network(Darknet::Network & net, Darknet::NetworkState state)
 	{
 		state.index = i;
 		Darknet::Layer & l = net.layers[i];
+		if (not state.train and l.inference_skip)
+		{
+			const int alias_index = resolve_inference_layer_index(net, i);
+			const int output_offset = resolve_inference_layer_output_offset(net, i);
+			if (alias_index >= 0 and alias_index < net.n)
+			{
+				state.input = net.layers[alias_index].output + output_offset;
+			}
+			continue;
+		}
 		if (l.delta && state.train && l.train)
 		{
 			scal_cpu(l.outputs * l.batch, 0, l.delta, 1);
@@ -310,8 +973,113 @@ float *get_network_output(Darknet::Network & net)
 			break;
 		}
 	}
+	const int output_offset = resolve_inference_layer_output_offset(net, i);
+	i = resolve_inference_layer_index(net, i);
 
-	return net.layers[i].output;
+	return net.layers[i].output + output_offset;
+}
+
+int inference_optimizer_is_disabled()
+{
+	TAT(TATPARMS);
+
+	return is_inference_optimizer_disabled() ? 1 : 0;
+}
+
+int resolve_inference_layer_index(const Darknet::Network & net, int layer_index)
+{
+	int guard = 0;
+	while (layer_index >= 0 and layer_index < net.n and guard < net.n)
+	{
+		const Darknet::Layer & l = net.layers[layer_index];
+		if (not l.inference_skip)
+		{
+			break;
+		}
+		if (l.inference_alias_layer < 0 or l.inference_alias_layer == layer_index)
+		{
+			break;
+		}
+		layer_index = l.inference_alias_layer;
+		guard += 1;
+	}
+	return layer_index;
+}
+
+int resolve_inference_layer_output_offset(const Darknet::Network & net, int layer_index)
+{
+	int output_offset = 0;
+	int guard = 0;
+	while (layer_index >= 0 and layer_index < net.n and guard < net.n)
+	{
+		const Darknet::Layer & l = net.layers[layer_index];
+		if (not l.inference_skip)
+		{
+			break;
+		}
+		output_offset += l.inference_alias_output_offset;
+		if (l.inference_alias_layer < 0 or l.inference_alias_layer == layer_index)
+		{
+			break;
+		}
+		layer_index = l.inference_alias_layer;
+		guard += 1;
+	}
+	return output_offset;
+}
+
+void optimize_network_for_inference(Darknet::Network & net)
+{
+	TAT(TATPARMS);
+
+	static std::mutex optimizer_mutex;
+	std::lock_guard<std::mutex> lock(optimizer_mutex);
+
+	if (net.inference_optimized or is_inference_optimizer_disabled())
+	{
+		return;
+	}
+
+	net.inference_optimizer_skipped_layers = 0;
+	net.inference_optimizer_fused_repconvn = 0;
+	net.inference_optimizer_aliased_routes = 0;
+	net.inference_optimizer_pruned_layers = 0;
+	net.inference_optimizer_fused_route_1x1 = 0;
+	net.inference_optimizer_direct_yolov9_heads = 0;
+	net.inference_optimizer_disabled_cudnn_half = 0;
+	net.inference_cuda_graph_enabled = 0;
+	net.inference_cuda_graph_captured = 0;
+	net.inference_cuda_graph_launches = 0;
+
+	for (int i = 1; i + 3 < net.n; ++i)
+	{
+		if (repconvn_pattern_matches(net, i))
+		{
+			fuse_repconvn_block(net, i);
+			i += 3;
+		}
+	}
+
+	alias_single_input_routes(net);
+
+	remap_inference_alias_consumers(net);
+	prune_unreachable_yolov9_branches(net);
+	remap_inference_alias_consumers(net);
+	fuse_route_concat_1x1_consumers(net);
+	mark_direct_yolov9_head_routes(net);
+	net.inference_optimizer_skipped_layers = count_inference_skipped_layers(net);
+	if (has_yolov9_output(net) and net.cudnn_half and not env_flag_is_set("DARKNET_ENABLE_YOLOV9_HALF_INFERENCE"))
+	{
+		net.cudnn_half = 0;
+		net.inference_optimizer_disabled_cudnn_half = 1;
+	}
+	if (has_yolov9_output(net) and not is_inference_cuda_graph_disabled())
+	{
+		net.use_cuda_graph = 1;
+		net.inference_cuda_graph_enabled = 1;
+	}
+	net.inference_optimized = 1;
+	maybe_log_inference_optimizer_summary(net);
 }
 
 
@@ -847,6 +1615,8 @@ float *network_predict(Darknet::Network & net, float * input)
 {
 	TAT(TATPARMS);
 
+	optimize_network_for_inference(net);
+
 #ifdef DARKNET_GPU
 	if (cfg_and_state.gpu_index >= 0)
 	{
@@ -1261,23 +2031,33 @@ static inline void fill_network_boxes_v3(Darknet::Network * net, int w, int h, f
 {
 	TAT(TATPARMS);
 
-	bool only_yolo_cache = true;
+	Darknet::Output_Object_Cache yolo_cache;
+	Darknet::Output_Object_Cache yolov9_cache;
 	for (const auto & oo : cache)
 	{
-		if (net->layers[oo.layer_index].type != Darknet::ELayerType::YOLO)
+		const auto type = net->layers[oo.layer_index].type;
+		if (type == Darknet::ELayerType::YOLO)
 		{
-			only_yolo_cache = false;
-			break;
+			yolo_cache.push_back(oo);
+		}
+		else if (type == Darknet::ELayerType::YOLOV9)
+		{
+			yolov9_cache.push_back(oo);
+		}
+		else
+		{
+			fill_network_boxes(net, w, h, thresh, hier, map, relative, dets, letter);
+			return;
 		}
 	}
 
-	if (only_yolo_cache)
+	if (not yolo_cache.empty())
 	{
-		dets += get_yolo_detections_v3(net, w, h, net->w, net->h, thresh, map, relative, dets, letter, cache);
+		dets += get_yolo_detections_v3(net, w, h, net->w, net->h, thresh, map, relative, dets, letter, yolo_cache);
 	}
-	else
+	if (not yolov9_cache.empty())
 	{
-		fill_network_boxes(net, w, h, thresh, hier, map, relative, dets, letter);
+		dets += get_yolov9_detections_v3(net, w, h, net->w, net->h, thresh, map, relative, dets, letter, yolov9_cache);
 	}
 }
 
@@ -1346,29 +2126,10 @@ DarknetDetection * get_network_boxes(DarknetNetworkPtr ptr, int w, int h, float 
 #else
 	// With V3 Jazz, we now create a "cache" list to track objects in the output array.
 
-	bool has_yolov9 = false;
-	for (int i = 0; i < net->n; ++i)
-	{
-		if (net->layers[i].type == Darknet::ELayerType::YOLOV9)
-		{
-			has_yolov9 = true;
-			break;
-		}
-	}
-
-	Darknet::Detection * dets = nullptr;
-	if (has_yolov9)
-	{
-		dets = make_network_boxes(net, thresh, num);
-		fill_network_boxes(net, w, h, thresh, hier, map, relative, dets, letter);
-	}
-	else
-	{
-		Darknet::Output_Object_Cache cache;
-		cache.reserve(250); // reserve 250 spaces in the cache to start (most YOLO networks don't have 250 objects per image!)
-		dets = make_network_boxes_v3(net, thresh, num, cache);
-		fill_network_boxes_v3(net, w, h, thresh, hier, map, relative, dets, letter, cache);
-	}
+	Darknet::Output_Object_Cache cache;
+	cache.reserve(250); // reserve 250 spaces in the cache to start (most YOLO networks don't have 250 objects per image!)
+	Darknet::Detection * dets = make_network_boxes_v3(net, thresh, num, cache);
+	fill_network_boxes_v3(net, w, h, thresh, hier, map, relative, dets, letter, cache);
 #endif
 
 	return dets;

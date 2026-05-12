@@ -101,10 +101,16 @@ void forward_route_layer(Darknet::Layer & l, Darknet::NetworkState state)
 	for (int i = 0; i < l.n; ++i)
 	{
 		int index = l.input_layers[i];
+		int output_offset = 0;
+		if (not state.train)
+		{
+			output_offset = resolve_inference_layer_output_offset(state.net, index);
+			index = resolve_inference_layer_index(state.net, index);
+		}
 #ifdef DARKNET_USE_MPS
 		mps_flush_deferred_output(&state.net.layers[index]);
 #endif
-		float *input = state.net.layers[index].output;
+		float *input = state.net.layers[index].output + output_offset;
 		int input_size = l.input_sizes[i];
 		int part_input_size = input_size / l.groups;
 		for (int j = 0; j < l.batch; ++j)
@@ -157,14 +163,20 @@ void forward_route_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state)
 	for (int i = 0; i < l.n; ++i)
 	{
 		int index = l.input_layers[i];
-		float *input = state.net.layers[index].output_gpu;
+		int output_offset = 0;
+		if (not state.train)
+		{
+			output_offset = resolve_inference_layer_output_offset(state.net, index);
+			index = resolve_inference_layer_index(state.net, index);
+		}
+		float *input = state.net.layers[index].output_gpu + output_offset;
 		int input_size = l.input_sizes[i];
 		int part_input_size = input_size / l.groups;
 		for (int j = 0; j < l.batch; ++j)
 		{
 			//copy_ongpu(input_size, input + j*input_size, 1, l.output_gpu + offset + j*l.outputs, 1);
 			//simple_copy_ongpu(input_size, input + j*input_size, l.output_gpu + offset + j*l.outputs);
-			simple_copy_ongpu(part_input_size, input + j*input_size + part_input_size*l.group_id, l.output_gpu + offset + j*l.outputs);
+			memcpy_ongpu(l.output_gpu + offset + j*l.outputs, input + j*input_size + part_input_size*l.group_id, part_input_size * sizeof(float));
 		}
 		//offset += input_size;
 		offset += part_input_size;

@@ -1,9 +1,258 @@
 #include "darknet_internal.hpp"
 
+#include <algorithm>
+#include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 
 namespace
 {
 	static auto & cfg_and_state = Darknet::CfgAndState::get();
+
+	struct LayerForwardProfile
+	{
+		std::vector<cudaEvent_t> start_events;
+		std::vector<cudaEvent_t> stop_events;
+		std::vector<double> total_ms;
+		std::vector<int> calls;
+		std::vector<int> executed_this_frame;
+		int layer_count = 0;
+		int seen_frames = 0;
+		int measured_frames = 0;
+		int warmup_frames = 0;
+		int target_frames = 0;
+		bool printed = false;
+	};
+
+	static std::unordered_map<Darknet::Network *, LayerForwardProfile> layer_forward_profiles;
+
+	static int get_env_int(const char * name, const int default_value)
+	{
+		const char * value = std::getenv(name);
+		if (value == nullptr or value[0] == '\0')
+		{
+			return default_value;
+		}
+		const int parsed = std::atoi(value);
+		return parsed > 0 ? parsed : default_value;
+	}
+
+	static bool gpu_layer_profile_enabled()
+	{
+		const char * value = std::getenv("DARKNET_PROFILE_LAYERS");
+		return value != nullptr and value[0] != '\0' and std::string(value) != "0";
+	}
+
+	static bool env_flag_is_set(const char * name)
+	{
+		const char * value = std::getenv(name);
+		return value != nullptr and value[0] != '\0' and std::string(value) != "0";
+	}
+
+	static bool cuda_graph_enabled(const Darknet::Network & net)
+	{
+		return net.use_cuda_graph == 1
+			and not gpu_layer_profile_enabled()
+			and not env_flag_is_set("DARKNET_DISABLE_INFERENCE_CUDA_GRAPH")
+			and not env_flag_is_set("DARKNET_DISABLE_CUDA_GRAPH")
+			and not env_flag_is_set("DARKNET_YOLOV9_PACK_INFERENCE_OUTPUT")
+			and not env_flag_is_set("DARKNET_YOLOV9_PULL_IN_FORWARD");
+	}
+
+	static bool cuda_graph_verbose()
+	{
+		return cfg_and_state.is_verbose or env_flag_is_set("DARKNET_INFERENCE_OPTIMIZER_VERBOSE");
+	}
+
+	static std::mutex & cuda_graph_mutex_for(Darknet::Network & net)
+	{
+		static std::mutex registry_mutex;
+		static std::map<void *, std::mutex> mutexes;
+
+		std::lock_guard<std::mutex> registry_lock(registry_mutex);
+		if (net.inference_cuda_graph_mutex == nullptr)
+		{
+			void * key = net.cuda_graph_ready ? static_cast<void *>(net.cuda_graph_ready) : static_cast<void *>(&net);
+			net.inference_cuda_graph_mutex = static_cast<void *>(&mutexes[key]);
+		}
+
+		return *reinterpret_cast<std::mutex *>(net.inference_cuda_graph_mutex);
+	}
+
+	static LayerForwardProfile & get_layer_forward_profile(Darknet::Network & net)
+	{
+		LayerForwardProfile & profile = layer_forward_profiles[&net];
+		if (profile.layer_count == net.n)
+		{
+			return profile;
+		}
+
+		for (cudaEvent_t event : profile.start_events)
+		{
+			if (event)
+			{
+				CHECK_CUDA(cudaEventDestroy(event));
+			}
+		}
+		for (cudaEvent_t event : profile.stop_events)
+		{
+			if (event)
+			{
+				CHECK_CUDA(cudaEventDestroy(event));
+			}
+		}
+
+		profile = {};
+		profile.layer_count = net.n;
+		profile.warmup_frames = get_env_int("DARKNET_PROFILE_LAYERS_WARMUP", 5);
+		profile.target_frames = get_env_int("DARKNET_PROFILE_LAYERS_FRAMES", 30);
+		profile.start_events.resize(net.n);
+		profile.stop_events.resize(net.n);
+		profile.total_ms.assign(net.n, 0.0);
+		profile.calls.assign(net.n, 0);
+		profile.executed_this_frame.reserve(net.n);
+
+		for (int i = 0; i < net.n; ++i)
+		{
+			CHECK_CUDA(cudaEventCreate(&profile.start_events[i]));
+			CHECK_CUDA(cudaEventCreate(&profile.stop_events[i]));
+		}
+
+		return profile;
+	}
+
+	static void print_layer_forward_profile(Darknet::Network & net, const LayerForwardProfile & profile)
+	{
+		const int top_count = get_env_int("DARKNET_PROFILE_LAYERS_TOP", 40);
+		struct Row
+		{
+			int index;
+			double total_ms;
+			double avg_ms;
+			int calls;
+		};
+		std::vector<Row> rows;
+		rows.reserve(net.n);
+		for (int i = 0; i < net.n; ++i)
+		{
+			if (profile.calls[i] <= 0)
+			{
+				continue;
+			}
+			rows.push_back(Row{i, profile.total_ms[i], profile.total_ms[i] / profile.calls[i], profile.calls[i]});
+		}
+		std::sort(rows.begin(), rows.end(), [](const Row & lhs, const Row & rhs)
+		{
+			return lhs.total_ms > rhs.total_ms;
+		});
+
+		struct TypeSummary
+		{
+			double total_ms = 0.0;
+			int calls = 0;
+		};
+		std::map<Darknet::ELayerType, TypeSummary> by_type;
+		for (const Row & row : rows)
+		{
+			TypeSummary & summary = by_type[net.layers[row.index].type];
+			summary.total_ms += row.total_ms;
+			summary.calls += row.calls;
+		}
+		std::vector<std::pair<Darknet::ELayerType, TypeSummary>> type_rows(by_type.begin(), by_type.end());
+		std::sort(type_rows.begin(), type_rows.end(), [](const auto & lhs, const auto & rhs)
+		{
+			return lhs.second.total_ms > rhs.second.total_ms;
+		});
+
+		*cfg_and_state.output
+			<< std::endl
+			<< "CUDA layer profile over " << profile.measured_frames
+			<< " inference forwards after " << profile.warmup_frames
+			<< " warmup forwards:" << std::endl
+			<< "Top layers by total forward time:" << std::endl;
+
+		for (int rank = 0; rank < static_cast<int>(rows.size()) and rank < top_count; ++rank)
+		{
+			const Row & row = rows[rank];
+			const Darknet::Layer & l = net.layers[row.index];
+			*cfg_and_state.output
+				<< "  #" << (rank + 1)
+				<< " layer=" << row.index
+				<< " type=" << Darknet::to_string(l.type)
+				<< " avg_ms=" << row.avg_ms
+				<< " total_ms=" << row.total_ms
+				<< " calls=" << row.calls
+				<< " out=" << l.out_w << "x" << l.out_h << "x" << l.out_c
+				<< " filters=" << l.n
+				<< " size=" << l.size
+				<< " groups=" << l.groups
+				<< std::endl;
+		}
+
+		*cfg_and_state.output << "Layer type summary:" << std::endl;
+		for (const auto & [type, summary] : type_rows)
+		{
+			*cfg_and_state.output
+				<< "  type=" << Darknet::to_string(type)
+				<< " avg_ms=" << (summary.total_ms / summary.calls)
+				<< " total_ms=" << summary.total_ms
+				<< " calls=" << summary.calls
+				<< std::endl;
+		}
+		*cfg_and_state.output << std::endl;
+	}
+
+	static void pull_yolov9_outputs_after_graph(Darknet::Network & net)
+	{
+		const bool force_full_pull = std::getenv("DARKNET_YOLOV9_PULL_AFTER_GRAPH") != nullptr;
+		switch_stream(0);
+		for (int layer_index = 0; layer_index < net.n; ++layer_index)
+		{
+			Darknet::Layer & l = net.layers[layer_index];
+			if (l.type != Darknet::ELayerType::YOLOV9)
+			{
+				continue;
+			}
+			if (not force_full_pull)
+			{
+				l.inference_cpu_outputs_valid = 0;
+				l.yolov9_compact_valid = 0;
+				continue;
+			}
+			if (l.inference_cpu_outputs_valid)
+			{
+				continue;
+			}
+			const int branch = std::max(0, std::min(l.inference_branch, l.branch_count - 1));
+			const int branch_offset = branch * l.n;
+			for (int scale = 0; scale < l.n; ++scale)
+			{
+				const int slot = branch_offset + scale;
+				if (slot < 0 or slot >= l.total)
+				{
+					continue;
+				}
+				Darknet::Layer & input = net.layers[l.input_layers[slot]];
+				if (input.type == Darknet::ELayerType::ROUTE and input.inference_direct_yolov9_head and input.n == 2 and input.input_layers != nullptr)
+				{
+					Darknet::Layer & box = net.layers[input.input_layers[0]];
+					Darknet::Layer & cls = net.layers[input.input_layers[1]];
+					cuda_pull_array_async(box.output_gpu, box.output, box.batch * box.outputs);
+					cuda_pull_array_async(cls.output_gpu, cls.output, cls.batch * cls.outputs);
+				}
+				else
+				{
+					cuda_pull_array_async(input.output_gpu, input.output, input.batch * input.outputs);
+				}
+			}
+			CHECK_CUDA(cudaPeekAtLastError());
+			CHECK_CUDA(cudaStreamSynchronize(get_cuda_stream()));
+			l.inference_cpu_outputs_valid = 1;
+		}
+	}
 }
 
 
@@ -45,23 +294,81 @@ void forward_network_gpu(Darknet::Network & net, Darknet::NetworkState state)
 	}
 
 	state.workspace = net.workspace;
+	LayerForwardProfile * layer_profile = nullptr;
+	bool profile_this_forward = false;
+	if (not state.train and gpu_layer_profile_enabled())
+	{
+		layer_profile = &get_layer_forward_profile(net);
+		if (not layer_profile->printed)
+		{
+			layer_profile->seen_frames += 1;
+			profile_this_forward =
+				layer_profile->seen_frames > layer_profile->warmup_frames and
+				layer_profile->measured_frames < layer_profile->target_frames;
+			if (profile_this_forward)
+			{
+				layer_profile->executed_this_frame.clear();
+			}
+		}
+	}
+
 	for (int i = 0; i < net.n; ++i)
 	{
 		state.index = i;
 		Darknet::Layer & l = net.layers[i];
+
+		if (not state.train and l.inference_skip)
+		{
+			const int alias_index = resolve_inference_layer_index(net, i);
+			const int output_offset = resolve_inference_layer_output_offset(net, i);
+			if (alias_index >= 0 and alias_index < net.n)
+			{
+				state.input = net.layers[alias_index].output_gpu + output_offset;
+			}
+			continue;
+		}
 
 		if (l.delta_gpu && state.train)
 		{
 			fill_ongpu(l.outputs * l.batch, 0, l.delta_gpu, 1);
 		}
 
+		if (profile_this_forward)
+		{
+			CHECK_CUDA(cudaEventRecord(layer_profile->start_events[i], get_cuda_stream()));
+			layer_profile->executed_this_frame.push_back(i);
+		}
+
 		l.forward_gpu(l, state);
+
+		if (profile_this_forward)
+		{
+			CHECK_CUDA(cudaEventRecord(layer_profile->stop_events[i], get_cuda_stream()));
+		}
 
 		if(net.wait_stream)
 		{
 			CHECK_CUDA(cudaStreamSynchronize(get_cuda_stream()));
 		}
 		state.input = l.output_gpu;
+	}
+
+	if (profile_this_forward)
+	{
+		CHECK_CUDA(cudaStreamSynchronize(get_cuda_stream()));
+		for (const int layer_index : layer_profile->executed_this_frame)
+		{
+			float elapsed_ms = 0.0f;
+			CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, layer_profile->start_events[layer_index], layer_profile->stop_events[layer_index]));
+			layer_profile->total_ms[layer_index] += elapsed_ms;
+			layer_profile->calls[layer_index] += 1;
+		}
+		layer_profile->measured_frames += 1;
+		if (layer_profile->measured_frames >= layer_profile->target_frames and not layer_profile->printed)
+		{
+			layer_profile->printed = true;
+			print_layer_forward_profile(net, *layer_profile);
+		}
 	}
 
 	if (net.benchmark_layers)
@@ -681,13 +988,19 @@ float *get_network_output_layer_gpu(Darknet::Network & net, int i)
 {
 	TAT(TATPARMS);
 
+	const int output_offset = resolve_inference_layer_output_offset(net, i);
+	i = resolve_inference_layer_index(net, i);
 	Darknet::Layer & l = net.layers[i];
-	if (l.type != Darknet::ELayerType::REGION && l.type != Darknet::ELayerType::YOLO && l.type != Darknet::ELayerType::YOLOV9 && (*net.cuda_graph_ready) == 0)
+	const bool graph_output_current =
+		net.inference_cuda_graph_enabled != 0 and
+		net.cuda_graph_ready != nullptr and
+		*net.cuda_graph_ready != 0;
+	if (l.type != Darknet::ELayerType::REGION && l.type != Darknet::ELayerType::YOLO && l.type != Darknet::ELayerType::YOLOV9 && not graph_output_current)
 	{
 		cuda_pull_array(l.output_gpu, l.output, l.outputs*l.batch);
 	}
 
-	return l.output;
+	return l.output + output_offset;
 }
 
 float *get_network_output_gpu(Darknet::Network & net)
@@ -710,6 +1023,22 @@ float *network_predict_gpu(Darknet::Network & net, float *input)
 {
 	TAT(TATPARMS);
 
+	optimize_network_for_inference(net);
+	const bool use_graph = cuda_graph_enabled(net);
+	net.inference_cuda_graph_enabled = use_graph ? 1 : 0;
+	std::unique_lock<std::mutex> graph_lock;
+	if (use_graph)
+	{
+		graph_lock = std::unique_lock<std::mutex>(cuda_graph_mutex_for(net));
+		const bool graph_was_ready = net.cuda_graph_ready != nullptr and *net.cuda_graph_ready != 0;
+		net.inference_cuda_graph_captured = graph_was_ready ? 1 : 0;
+	}
+	else
+	{
+		const bool graph_was_ready = net.cuda_graph_ready != nullptr and *net.cuda_graph_ready != 0;
+		net.inference_cuda_graph_captured = graph_was_ready ? 1 : 0;
+	}
+
 	if (net.gpu_index != cuda_get_device())
 	{
 		cuda_set_device(net.gpu_index);
@@ -724,14 +1053,25 @@ float *network_predict_gpu(Darknet::Network & net, float *input)
 	state.truth = 0;
 	state.train = 0;
 	state.delta = 0;
-
-	//cudaGraphExec_t instance = (cudaGraphExec_t)net.cuda_graph_exec;
-	static cudaGraphExec_t instance;
-
-	if ((*net.cuda_graph_ready) == 0)
+	for (int i = 0; i < net.n; ++i)
 	{
-		static cudaGraph_t graph;
-		if (net.use_cuda_graph == 1)
+		if (net.layers[i].type == Darknet::ELayerType::YOLOV9)
+		{
+			net.layers[i].inference_cpu_outputs_valid = 0;
+			net.layers[i].yolov9_compact_valid = 0;
+		}
+	}
+
+	if (use_graph)
+	{
+		switch_stream(0);
+	}
+	cuda_push_array(state.input, net.input_pinned_cpu, size);
+
+	if (use_graph)
+	{
+		cudaGraphExec_t instance = reinterpret_cast<cudaGraphExec_t>(net.cuda_graph_exec);
+		if ((*net.cuda_graph_ready) == 0 or instance == nullptr)
 		{
 			for (int i = 0; i < 16; ++i)
 			{
@@ -739,35 +1079,62 @@ float *network_predict_gpu(Darknet::Network & net, float *input)
 			}
 
 			cudaStream_t stream0 = switch_stream(0);
+
+			// cuDNN/cuBLAS may lazily initialize kernels and workspaces on the first pass.
+			// Run that pass outside capture, then capture the steady-state inference graph.
 			CHECK_CUDA(cudaDeviceSynchronize());
-			*cfg_and_state.output << "Try to capture graph..." << std::endl;
-			//cudaGraph_t graph = (cudaGraph_t)net.cuda_graph;
+			forward_network_gpu(net, state);
+			CHECK_CUDA(cudaStreamSynchronize(stream0));
+
+			for (int i = 0; i < net.n; ++i)
+			{
+				if (net.layers[i].type == Darknet::ELayerType::YOLOV9)
+				{
+					net.layers[i].inference_cpu_outputs_valid = 0;
+					net.layers[i].yolov9_compact_valid = 0;
+				}
+			}
+
+			if (cuda_graph_verbose())
+			{
+				*cfg_and_state.output << "Try to capture graph..." << std::endl;
+			}
+			cudaGraph_t graph = nullptr;
 			CHECK_CUDA(cudaStreamBeginCapture(stream0, cudaStreamCaptureModeGlobal));
-		}
 
-		cuda_push_array(state.input, net.input_pinned_cpu, size);
-		forward_network_gpu(net, state);
+			forward_network_gpu(net, state);
 
-		if (net.use_cuda_graph == 1)
-		{
-			cudaStream_t stream0 = switch_stream(0);
 			CHECK_CUDA(cudaStreamEndCapture(stream0, &graph));
 			CHECK_CUDA(cudaGraphInstantiate(&instance, graph, NULL, NULL, 0));
+			net.cuda_graph = reinterpret_cast<void *>(graph);
+			net.cuda_graph_exec = reinterpret_cast<void *>(instance);
 			(*net.cuda_graph_ready) = 1;
-			*cfg_and_state.output << "Graph is captured..." << std::endl;
+			net.inference_cuda_graph_captured = 1;
+			if (cuda_graph_verbose())
+			{
+				*cfg_and_state.output << "Graph is captured..." << std::endl;
+			}
 			CHECK_CUDA(cudaDeviceSynchronize());
 		}
-
-		CHECK_CUDA(cudaStreamSynchronize(get_cuda_stream()));
+		else
+		{
+			cudaStream_t stream0 = switch_stream(0);
+			CHECK_CUDA(cudaGraphLaunch(instance, stream0));
+			CHECK_CUDA(cudaStreamSynchronize(stream0));
+			net.inference_cuda_graph_launches += 1;
+		}
 	}
 	else
 	{
-		cudaStream_t stream0 = switch_stream(0);
-		CHECK_CUDA( cudaGraphLaunch(instance, stream0) );
-		CHECK_CUDA( cudaStreamSynchronize(stream0) );
+		forward_network_gpu(net, state);
+		CHECK_CUDA(cudaStreamSynchronize(get_cuda_stream()));
 	}
 
 	float *out = get_network_output_gpu(net);
+	if (use_graph)
+	{
+		pull_yolov9_outputs_after_graph(net);
+	}
 	reset_wait_stream_events();
 	//cuda_free(state.input);   // will be freed in the free_network()
 	return out;

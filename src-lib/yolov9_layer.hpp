@@ -10,6 +10,7 @@ int yolov9_num_detections(const Darknet::Network * net, const Darknet::Layer & l
 int yolov9_num_detections_v3(Darknet::Network * net, const int index, const float thresh, Darknet::Output_Object_Cache & cache);
 int yolov9_num_detections_batch(const Darknet::Network * net, const Darknet::Layer & l, float thresh, int batch);
 int get_yolov9_detections(const Darknet::Network * net, const Darknet::Layer & l, int w, int h, int netw, int neth, float thresh, int *map, int relative, Darknet::Detection *dets, int letter);
+int get_yolov9_detections_v3(Darknet::Network * net, int w, int h, int netw, int neth, float thresh, int *map, int relative, Darknet::Detection *dets, int letter, Darknet::Output_Object_Cache & cache);
 int get_yolov9_detections_batch(const Darknet::Network * net, const Darknet::Layer & l, int w, int h, int netw, int neth, float thresh, int *map, int relative, Darknet::Detection *dets, int letter, int batch);
 
 float yolov9_dfl_project(const float *logits, int reg_max);
@@ -19,4 +20,6 @@ Darknet::Box yolov9_dist2bbox(float anchor_x, float anchor_y, const float distan
 #ifdef DARKNET_GPU
 void forward_yolov9_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state);
 void backward_yolov9_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state);
+void train_yolov9_single_branch_gpu(Darknet::Layer & l, Darknet::NetworkState state);
+int compact_yolov9_detections_gpu(Darknet::Layer & l, int netw, int neth, float thresh_logit);
 #endif

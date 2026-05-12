@@ -1,4 +1,8 @@
+#include <algorithm>
 #include <csignal>
+#include <fstream>
+#include <iomanip>
+#include <set>
 
 #if defined(_MSC_VER) && defined(_DEBUG)
 #include <crtdbg.h>
@@ -194,7 +198,6 @@ void partial(char *cfgfile, char *weightfile, char *outfile, int max)
 {
 	TAT(TATPARMS);
 
-	Darknet::CfgAndState::get().gpu_index = -1;
 	Darknet::Network net = parse_network_cfg_custom(cfgfile, 1, 1);
 
 	if(weightfile)
@@ -408,6 +411,154 @@ void statistics_net(const char * cfgfile, const char * weightfile)
 	}
 }
 
+void write_json_float_array(std::ostream & out, const float * data, const size_t count)
+{
+	TAT(TATPARMS);
+
+	out << "[";
+	for (size_t idx = 0; idx < count; ++idx)
+	{
+		if (idx > 0)
+		{
+			out << ",";
+		}
+		out << std::setprecision(9) << data[idx];
+	}
+	out << "]";
+}
+
+std::vector<float> read_float32_tensor(const char * filename, const size_t expected_count)
+{
+	TAT(TATPARMS);
+
+	std::ifstream input(filename, std::ios::binary);
+	if (not input.good())
+	{
+		throw std::runtime_error(std::string("failed to open input tensor: ") + filename);
+	}
+	std::vector<float> values(expected_count);
+	input.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(expected_count * sizeof(float)));
+	const std::streamsize bytes_read = input.gcount();
+	const std::streamsize expected_bytes = static_cast<std::streamsize>(expected_count * sizeof(float));
+	if (bytes_read != expected_bytes)
+	{
+		throw std::runtime_error(
+			"input tensor byte count mismatch: expected " +
+			std::to_string(expected_bytes) +
+			", read " +
+			std::to_string(bytes_read));
+	}
+	return values;
+}
+
+void dump_yolov9_logits(const char * cfgfile, const char * weightfile, const char * input_tensor, const char * outfile)
+{
+	TAT(TATPARMS);
+
+	if (cfgfile == nullptr or weightfile == nullptr or input_tensor == nullptr or outfile == nullptr)
+	{
+		throw std::invalid_argument("usage: darknet dumpyolov9 <cfg> <weights|-> <input.float32> <output.json>");
+	}
+
+#ifdef DARKNET_GPU
+	if (cfg_and_state.gpu_index < 0)
+	{
+		cfg_and_state.gpu_index = 0;
+	}
+	cuda_set_device(cfg_and_state.gpu_index);
+#endif
+
+	Darknet::Network net = parse_network_cfg_custom(cfgfile, 1, 1);
+	if (std::string(weightfile) != "-")
+	{
+		load_weights(&net, const_cast<char*>(weightfile));
+	}
+
+	const size_t input_count = static_cast<size_t>(get_network_input_size(net));
+	std::vector<float> input = read_float32_tensor(input_tensor, input_count);
+	network_predict(net, input.data());
+
+	std::ofstream output(outfile);
+	if (not output.good())
+	{
+		free_network(net);
+		throw std::runtime_error(std::string("failed to open output JSON: ") + outfile);
+	}
+
+	output << "{\n  \"tensors\": {\n";
+	bool first_tensor = true;
+	std::set<int> emitted_layers;
+	for (int layer_idx = 0; layer_idx < net.n; ++layer_idx)
+	{
+		const Darknet::Layer & yolo = net.layers[layer_idx];
+		if (yolo.type != Darknet::ELayerType::YOLOV9)
+		{
+			continue;
+		}
+		for (int slot = 0; slot < yolo.total; ++slot)
+		{
+			const int source_idx = yolo.input_layers[slot];
+			if (emitted_layers.count(source_idx) > 0)
+			{
+				continue;
+			}
+			emitted_layers.insert(source_idx);
+			const Darknet::Layer & source = net.layers[source_idx];
+			const int channels = source.out_c > 0 ? source.out_c : source.c;
+			const int height = source.out_h > 0 ? source.out_h : source.h;
+			const int width = source.out_w > 0 ? source.out_w : source.w;
+			if (channels <= 0 or height <= 0 or width <= 0)
+			{
+				free_network(net);
+				throw std::runtime_error("cannot infer 4D output shape for layer " + std::to_string(source_idx));
+			}
+			const size_t spatial_count = static_cast<size_t>(channels) * height * width;
+			if (spatial_count != static_cast<size_t>(source.outputs))
+			{
+				free_network(net);
+				throw std::runtime_error(
+					"layer " +
+					std::to_string(source_idx) +
+					" output count does not match inferred CHW shape");
+			}
+			if (not first_tensor)
+			{
+				output << ",\n";
+			}
+			first_tensor = false;
+			std::vector<float> values(spatial_count);
+#ifdef DARKNET_GPU
+			if (cfg_and_state.gpu_index >= 0 and source.output_gpu)
+			{
+				cuda_pull_array(source.output_gpu, values.data(), spatial_count);
+			}
+			else
+#endif
+			{
+				if (source.output == nullptr)
+				{
+					free_network(net);
+					throw std::runtime_error("layer " + std::to_string(source_idx) + " has no CPU output buffer");
+				}
+				std::copy(source.output, source.output + spatial_count, values.data());
+			}
+			output
+				<< "    \"layer_" << source_idx << "/output\": {\"shape\": [1, "
+				<< channels << ", " << height << ", " << width << "], \"data\": ";
+			write_json_float_array(output, values.data(), spatial_count);
+			output << "}";
+		}
+	}
+	output << "\n  }\n}\n";
+	free_network(net);
+
+	if (emitted_layers.empty())
+	{
+		throw std::runtime_error("no YOLOv9 layers were found in cfg");
+	}
+	*cfg_and_state.output << "wrote " << emitted_layers.size() << " YOLOv9 input tensor(s) to " << outfile << std::endl;
+}
+
 void denormalize_net(char *cfgfile, char *weightfile, char *outfile)
 {
 	TAT(TATPARMS);
@@ -551,6 +702,14 @@ int main(int argc, char **argv)
 		else if (cfg_and_state.command == "cfglayers")		{ Darknet::cfg_layers();			}
 		else if (cfg_and_state.command == "denormalize")	{ denormalize_net	(argv[2], argv[3], argv[4]); }
 		else if (cfg_and_state.command == "detector")		{ run_detector		(argc, argv);	}
+		else if (cfg_and_state.command == "dumpyolov9")
+		{
+			if (argc < 6)
+			{
+				throw std::invalid_argument("usage: darknet dumpyolov9 <cfg> <weights|-> <input.float32> <output.json>");
+			}
+			dump_yolov9_logits(argv[2], argv[3], argv[4], argv[5]);
+		}
 		else if (cfg_and_state.command == "help")			{ Darknet::display_usage();			}
 		else if (cfg_and_state.command == "nightmare")		{ run_nightmare		(argc, argv);	}
 		else if (cfg_and_state.command == "normalize")		{ normalize_net		(argv[2], argv[3], argv[4]); }

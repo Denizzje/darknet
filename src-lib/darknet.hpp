@@ -396,6 +396,28 @@ namespace Darknet
 	 */
 	using Predictions = std::vector<Prediction>;
 
+	/** Timing details for the most recent call to @ref Darknet::predict() on the current thread.
+	 *
+	 * These values are primarily intended for benchmark applications.  The network forward bucket contains the actual
+	 * neural network execution.  The postprocess bucket contains detection extraction from the network outputs, including
+	 * YOLOv9/DDetect decode when used.  NMS is reported separately.
+	 *
+	 * @since 2026-05-09
+	 */
+	struct PredictionTiming
+	{
+		double network_forward_ms = 0.0;
+		double postprocess_ms = 0.0;
+		double nms_ms = 0.0;
+		double conversion_ms = 0.0;
+	};
+
+	/** Return timing details for the most recent @ref Darknet::predict() call on this thread.
+	 *
+	 * @since 2026-05-09
+	 */
+	PredictionTiming latest_prediction_timing();
+
 	/** Get %Darknet to look at the given image or video frame and return all predictions.
 	 *
 	 * This is similar to the other @ref Darknet::predict() that takes a @p Darknet::Image object as input.

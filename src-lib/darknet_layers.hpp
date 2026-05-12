@@ -83,6 +83,18 @@ namespace Darknet
 		int use_bin_output;
 		int keep_delta_gpu;
 		int optimized_memory;
+		int inference_skip; ///< inference optimizer: skip this train-time helper layer and use @ref inference_alias_layer
+		int inference_alias_layer; ///< inference optimizer: layer whose output represents this skipped layer
+		int inference_alias_output_offset; ///< inference optimizer: element offset into the aliased layer output
+		int inference_cpu_outputs_valid; ///< YOLOv9 inference: selected GPU head tensors have been pulled to CPU
+		int inference_fused_route_layer; ///< inference optimizer: convolution consumes this concat route without materializing it
+		int inference_fused_route_input_count; ///< inference optimizer: number of route inputs consumed by the fused convolution
+		int inference_direct_yolov9_head; ///< inference optimizer: route is a box/class YOLOv9 head concat consumed directly
+		int yolov9_compact_valid; ///< YOLOv9 inference: compact decoded GPU output is valid for the current prediction/threshold
+		int yolov9_compact_count; ///< YOLOv9 inference: number of compact decoded output records
+		int yolov9_compact_capacity; ///< YOLOv9 inference: max compact decoded output records allocated
+		int yolov9_compact_stride; ///< YOLOv9 inference: floats per compact decoded output record
+		float yolov9_compact_thresh; ///< YOLOv9 inference: threshold used to produce the current compact output records
 		int steps;
 		int history_size;
 		int bottleneck;
@@ -204,6 +216,8 @@ namespace Darknet
 		int *strides;
 		int branch_count;
 		int inference_branch;
+		int *inference_fused_route_input_sizes;
+		float **inference_fused_route_layers_output;
 		int tal_topk;
 		float tal_alpha;
 		float tal_beta;
@@ -308,6 +322,7 @@ namespace Darknet
 		float * prev_state_cpu;
 
 		float *temp_cpu;
+		float *yolov9_compact_cpu;
 		float *temp2_cpu;
 		float *temp3_cpu;
 
@@ -483,6 +498,10 @@ namespace Darknet
 		int *input_sizes_gpu;
 		float **layers_output_gpu;
 		float **layers_delta_gpu;
+		int *inference_fused_route_input_sizes_gpu;
+		float **inference_fused_route_layers_output_gpu;
+		int *yolov9_compact_count_gpu;
+		float *yolov9_compact_gpu;
 #ifdef CUDNN
 		cudnnTensorDescriptor_t srcTensorDesc, dstTensorDesc;
 		cudnnTensorDescriptor_t srcTensorDesc16, dstTensorDesc16;

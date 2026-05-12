@@ -1,6 +1,17 @@
 #include "gemm.hpp"
 #include "darknet_internal.hpp"
 
+#include <cstdlib>
+
+namespace
+{
+	bool env_flag_is_set(const char * name)
+	{
+		const char * value = std::getenv(name);
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+	}
+}
+
 
 Darknet::Layer make_shortcut_layer(int batch, int n, int *input_layers, int* input_sizes, int w, int h, int c,
 	float **layers_output, float **layers_delta, float **layers_output_gpu, float **layers_delta_gpu, WEIGHTS_TYPE_T weights_type, WEIGHTS_NORMALIZATION_T weights_normalization,
@@ -259,6 +270,12 @@ void update_shortcut_layer(Darknet::Layer & l, int batch, float learning_rate_in
 void forward_shortcut_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state)
 {
 	TAT(TATPARMS);
+	const bool fused_simple_swish =
+		!state.train
+		&& l.activation == SWISH
+		&& l.n == 1
+		&& l.nweights == 0
+		&& !env_flag_is_set("DARKNET_DISABLE_SHORTCUT_SWISH_FUSION");
 
 	//copy_ongpu(l.outputs*l.batch, state.input, 1, l.output_gpu, 1);
 	//simple_copy_ongpu(l.outputs*l.batch, state.input, l.output_gpu);
@@ -274,13 +291,21 @@ void forward_shortcut_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state)
 	//        state.net.layers[l.index].output_gpu, l.out_w, l.out_h, l.out_c, l.output_gpu);
 	//}
 	//else
+	if (fused_simple_swish)
+	{
+		shortcut_singlelayer_swish_gpu(l.outputs, l.batch, l.input_sizes_gpu, l.layers_output_gpu, l.output_gpu, state.input);
+	}
+	else
 	{
 		shortcut_multilayer_gpu(l.outputs, l.batch, l.n, l.input_sizes_gpu, l.layers_output_gpu, l.output_gpu, state.input, l.weights_gpu, l.nweights, l.weights_normalization);
 	}
 
-	if (l.activation == SWISH) activate_array_swish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
-	else if (l.activation == MISH) activate_array_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
-	else activate_array_ongpu(l.output_gpu, l.outputs*l.batch, l.activation);
+	if (!fused_simple_swish)
+	{
+		if (l.activation == SWISH) activate_array_swish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
+		else if (l.activation == MISH) activate_array_mish_ongpu(l.output_gpu, l.outputs*l.batch, l.activation_input_gpu, l.output_gpu);
+		else activate_array_ongpu(l.output_gpu, l.outputs*l.batch, l.activation);
+	}
 
 }
 

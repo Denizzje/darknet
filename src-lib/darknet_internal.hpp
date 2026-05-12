@@ -82,6 +82,7 @@ namespace Darknet
 		int n;				///< What is "n"...the mask (anchor?) number?
 		int i;				///< The entry index into the W x H output array for the given YOLO layer.
 		int obj_index;		///< The index into the YOLO output array -- as obtained from @ref yolo_entry_index() -- which is used to get the objectness value.  E.g., a value of @p "l.output[obj_index] == 0.999f" would indicate that there is an object at this location.
+		int compact_index;	///< YOLOv9 GPU compact-output record index, or -1 when using the normal CPU tensor path.
 	};
 	using Output_Object_Cache = std::vector<Output_Object>;
 
@@ -336,9 +337,11 @@ void init_cpu();
  * boxes.
  */
 int yolo_num_detections_v3(Darknet::Network * net, const int index, const float thresh, Darknet::Output_Object_Cache & cache);
+int yolov9_num_detections_v3(Darknet::Network * net, const int index, const float thresh, Darknet::Output_Object_Cache & cache);
 
 /// Convert everything we've detected into bounding boxes and confidence scores for each class.
 int get_yolo_detections_v3(Darknet::Network * net, int w, int h, int netw, int neth, float thresh, int *map, int relative, Darknet::Detection *dets, int letter, Darknet::Output_Object_Cache & cache);
+int get_yolov9_detections_v3(Darknet::Network * net, int w, int h, int netw, int neth, float thresh, int *map, int relative, Darknet::Detection *dets, int letter, Darknet::Output_Object_Cache & cache);
 
 #include "darknet_args_and_parms.hpp"
 #include "darknet_cfg_and_state.hpp"
