@@ -1839,13 +1839,14 @@ void update_convolutional_layer(Darknet::Layer & l, int batch, float learning_ra
 {
 	TAT(TATPARMS);
 
-	const float learning_rate = learning_rate_init * l.learning_rate_scale;
+	const float learning_rate = l.use_current_update_rates ? l.current_learning_rate : learning_rate_init * l.learning_rate_scale;
+	const float bias_learning_rate = l.use_current_update_rates ? l.current_bias_learning_rate : learning_rate;
 
 	axpy_cpu(l.nweights, -decay*batch, l.weights, 1, l.weight_updates, 1);
 	axpy_cpu(l.nweights, learning_rate / batch, l.weight_updates, 1, l.weights, 1);
 	scal_cpu(l.nweights, momentum, l.weight_updates, 1);
 
-	axpy_cpu(l.n, learning_rate / batch, l.bias_updates, 1, l.biases, 1);
+	axpy_cpu(l.n, bias_learning_rate / batch, l.bias_updates, 1, l.biases, 1);
 	scal_cpu(l.n, momentum, l.bias_updates, 1);
 
 	if (l.scales)

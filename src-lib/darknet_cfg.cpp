@@ -866,6 +866,16 @@ Darknet::Network & Darknet::CfgFile::create_network(int batch, int time_steps)
 			case ELayerType::CONVOLUTIONAL:	{l = parse_convolutional_section(idx);							break;}
 			case ELayerType::MAXPOOL:		{l = parse_maxpool_section(idx);								break;}
 			case ELayerType::UPSAMPLE:		{l = parse_upsample_section(idx);								break;}
+			case ELayerType::CHANNEL_SLICE:
+			{
+				l = parse_channel_slice_section(idx);
+				net.layers[l.input_layers[0]].use_bin_output = 0;
+				if (idx >= parms.last_stop_backward)
+				{
+					net.layers[l.input_layers[0]].keep_delta_gpu = 1;
+				}
+				break;
+			}
 			case ELayerType::CONNECTED:		{l = parse_connected_section(idx);								break;}
 			case ELayerType::CRNN:			{l = parse_crnn_section(idx);									break;}
 			case ELayerType::RNN:			{l = parse_rnn_section(idx);									break;}
@@ -1291,6 +1301,10 @@ Darknet::CfgFile & Darknet::CfgFile::parse_net_section()
 	net.max_batches = s.find_int("max_batches", 0);
 	net.batch = s.find_int("batch",1);
 	net.learning_rate = s.find_float("learning_rate", .001);
+	net.lrf = s.find_float("lrf", 0.0f);
+	net.final_learning_rate = s.find_float(
+		"final_learning_rate",
+		net.lrf > 0.0f ? net.learning_rate * net.lrf : net.learning_rate);
 	net.learning_rate_min = s.find_float("learning_rate_min", .00001);
 	net.batches_per_cycle = s.find_int("sgdr_cycle", net.max_batches);
 	net.batches_cycle_mult = s.find_int("sgdr_mult", 2);
@@ -1343,6 +1357,19 @@ Darknet::CfgFile & Darknet::CfgFile::parse_net_section()
 	net.inputs = s.find_int("inputs", net.h * net.w * net.c);
 //	net.max_crop = s.find_int("max_crop",net.w * 2);
 //	net.min_crop = s.find_int("min_crop",net.w);
+	const std::string augment_policy = s.find_str("augment_policy", "legacy");
+	if (augment_policy == "legacy" or augment_policy == "darknet" or augment_policy.empty())
+	{
+		net.augment_policy = 0;
+	}
+	else if (augment_policy == "yolov9")
+	{
+		net.augment_policy = 1;
+	}
+	else
+	{
+		darknet_fatal_error(DARKNET_LOC, "unsupported augment_policy=\"%s\"", augment_policy.c_str());
+	}
 	net.flip = s.find_int("flip", 1);
 	net.blur = s.find_int("blur", 0);
 	net.gaussian_noise = s.find_int("gaussian_noise", 0);
@@ -1383,6 +1410,19 @@ Darknet::CfgFile & Darknet::CfgFile::parse_net_section()
 	net.saturation = s.find_float("saturation", 1);
 	net.exposure = s.find_float("exposure", 1);
 	net.hue = s.find_float("hue", 0);
+	net.hsv_h = s.find_float("hsv_h", net.hue);
+	net.hsv_s = s.find_float("hsv_s", 0.0f);
+	net.hsv_v = s.find_float("hsv_v", 0.0f);
+	net.degrees = s.find_float("degrees", net.angle);
+	net.translate = s.find_float("translate", 0.0f);
+	net.yolov9_scale = s.find_float("yolov9_scale", 0.0f);
+	net.shear = s.find_float("shear", 0.0f);
+	net.perspective = s.find_float("perspective", 0.0f);
+	net.flipud_prob = s.find_float("flipud_prob", 0.0f);
+	net.fliplr_prob = s.find_float("fliplr_prob", static_cast<float>(net.flip) * 0.5f);
+	net.mosaic_prob = s.find_float("mosaic_prob", mosaic ? 1.0f : 0.0f);
+	net.mixup_prob = s.find_float("mixup_prob", 0.0f);
+	net.copy_paste_prob = s.find_float("copy_paste_prob", 0.0f);
 	net.power = s.find_float("power", 4);
 
 	if (!net.inputs && !(net.h && net.w && net.c))
@@ -1393,6 +1433,13 @@ Darknet::CfgFile & Darknet::CfgFile::parse_net_section()
 	net.policy = static_cast<learning_rate_policy>(Darknet::get_learning_rate_policy_from_name(s.find_str("policy", "constant")));
 
 	net.burn_in = s.find_int("burn_in", 0);
+	net.warmup_iterations = s.find_int("warmup_iterations", 0);
+	net.warmup_bias_lr = s.find_float("warmup_bias_lr", net.learning_rate);
+	net.warmup_momentum = s.find_float("warmup_momentum", net.momentum);
+	net.warmup_nonbias_lr_start = s.find_float("warmup_nonbias_lr_start", 0.0f);
+	net.close_mosaic_epochs = s.find_int("close_mosaic_epochs", 0);
+	net.close_mosaic_iteration = s.find_int("close_mosaic_iteration", 0);
+	net.close_mosaic_logged = 0;
 
 #ifdef DARKNET_GPU
 	if (net.gpu_index >= 0)
@@ -1929,6 +1976,55 @@ Darknet::Layer Darknet::CfgFile::parse_upsample_section(const size_t section_idx
 	Darknet::Layer l = make_upsample_layer(parms.batch, parms.w, parms.h, parms.c, stride);
 
 	l.scale = s.find_float("scale", 1);
+
+	return l;
+}
+
+
+Darknet::Layer Darknet::CfgFile::parse_channel_slice_section(const size_t section_idx)
+{
+	TAT(TATPARMS);
+
+	auto & s = sections.at(section_idx);
+
+	int from = s.find_int("from");
+	if (from < 0)
+	{
+		from = parms.index + from;
+	}
+	if (from < 0 or from >= parms.index)
+	{
+		darknet_fatal_error(DARKNET_LOC, "cannot channel_slice layer #%d in [%s] at line #%ld", from, s.name.c_str(), s.line_number);
+	}
+
+	const int channel_start = s.find_int("channel_start");
+	const int channel_count = s.find_int("channel_count");
+	const Darknet::Layer & input = net.layers[from];
+	if (channel_start < 0 or channel_count <= 0 or channel_start + channel_count > input.out_c)
+	{
+		darknet_fatal_error(
+			DARKNET_LOC,
+			"invalid channel_slice at line #%ld: start=%d count=%d source_channels=%d",
+			s.line_number,
+			channel_start,
+			channel_count,
+			input.out_c);
+	}
+
+	Darknet::Layer l = make_channel_slice_layer(
+		parms.batch,
+		from,
+		input.out_w,
+		input.out_h,
+		input.out_c,
+		channel_start,
+		channel_count);
+	l.w = input.out_w;
+	l.h = input.out_h;
+	l.c = input.out_c;
+	l.out_w = input.out_w;
+	l.out_h = input.out_h;
+	l.out_c = channel_count;
 
 	return l;
 }

@@ -165,16 +165,19 @@ void update_connected_layer(Darknet::Layer & l, int batch, float learning_rate, 
 {
 	TAT(TATPARMS);
 
-	axpy_cpu(l.outputs, learning_rate/batch, l.bias_updates, 1, l.biases, 1);
+	const float weight_learning_rate = l.use_current_update_rates ? l.current_learning_rate : learning_rate * l.learning_rate_scale;
+	const float bias_learning_rate = l.use_current_update_rates ? l.current_bias_learning_rate : weight_learning_rate;
+
+	axpy_cpu(l.outputs, bias_learning_rate/batch, l.bias_updates, 1, l.biases, 1);
 	scal_cpu(l.outputs, momentum, l.bias_updates, 1);
 
 	if(l.batch_normalize){
-		axpy_cpu(l.outputs, learning_rate/batch, l.scale_updates, 1, l.scales, 1);
+		axpy_cpu(l.outputs, weight_learning_rate/batch, l.scale_updates, 1, l.scales, 1);
 		scal_cpu(l.outputs, momentum, l.scale_updates, 1);
 	}
 
 	axpy_cpu(l.inputs*l.outputs, -decay*batch, l.weights, 1, l.weight_updates, 1);
-	axpy_cpu(l.inputs*l.outputs, learning_rate/batch, l.weight_updates, 1, l.weights, 1);
+	axpy_cpu(l.inputs*l.outputs, weight_learning_rate/batch, l.weight_updates, 1, l.weights, 1);
 	scal_cpu(l.inputs*l.outputs, momentum, l.weight_updates, 1);
 }
 
@@ -351,7 +354,8 @@ void update_connected_layer_gpu(Darknet::Layer & l, int batch, float learning_ra
 {
 	TAT(TATPARMS);
 
-	float learning_rate = learning_rate_init * l.learning_rate_scale;
+	const float learning_rate = l.use_current_update_rates ? l.current_learning_rate : learning_rate_init * l.learning_rate_scale;
+	const float bias_learning_rate = l.use_current_update_rates ? l.current_bias_learning_rate : learning_rate;
 
 	// Loss scale for Mixed-Precision on Tensor-Cores
 	if (loss_scale != 1.0) {
@@ -360,7 +364,7 @@ void update_connected_layer_gpu(Darknet::Layer & l, int batch, float learning_ra
 		scal_ongpu(l.outputs, 1.0 / loss_scale, l.scale_updates_gpu, 1);
 	}
 
-	axpy_ongpu(l.outputs, learning_rate/batch, l.bias_updates_gpu, 1, l.biases_gpu, 1);
+	axpy_ongpu(l.outputs, bias_learning_rate/batch, l.bias_updates_gpu, 1, l.biases_gpu, 1);
 	scal_ongpu(l.outputs, momentum, l.bias_updates_gpu, 1);
 
 	if(l.batch_normalize){

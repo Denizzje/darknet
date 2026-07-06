@@ -1701,7 +1701,7 @@ void forward_yolov9_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state)
 		state.train and
 		not l.onlyforward and
 		state.truth != nullptr and
-		l.branch_count == 1 and
+		(l.branch_count == 1 or l.branch_count == 2) and
 		not force_cpu_fallback;
 
 	if (can_use_native_gpu_training)
@@ -1709,7 +1709,7 @@ void forward_yolov9_layer_gpu(Darknet::Layer & l, Darknet::NetworkState state)
 		static bool logged_native_gpu_path = false;
 		if (not logged_native_gpu_path)
 		{
-			*cfg_and_state.output << "YOLOv9: using native CUDA single-branch DDetect/TAL training path." << std::endl;
+			*cfg_and_state.output << "YOLOv9: using native CUDA DDetect/DualDDetect TAL training path." << std::endl;
 			logged_native_gpu_path = true;
 		}
 		require_yolov9_ciou_loss(l.iou_loss);

@@ -786,65 +786,135 @@ int get_sequence_value(const Darknet::Network & net)
 }
 
 
+namespace
+{
+	float clamp01(const float value)
+	{
+		if (value < 0.0f)
+		{
+			return 0.0f;
+		}
+		if (value > 1.0f)
+		{
+			return 1.0f;
+		}
+		return value;
+	}
+
+	float lerp(const float start, const float end, const float fraction)
+	{
+		return start + (end - start) * clamp01(fraction);
+	}
+
+	float get_current_rate_without_warmup(const Darknet::Network & net, const int batch_num)
+	{
+		int i;
+		float rate;
+		switch (net.policy)
+		{
+			case CONSTANT:
+				return net.learning_rate;
+			case STEP:
+				return net.learning_rate * pow(net.scale, batch_num/net.step);
+			case STEPS:
+				rate = net.learning_rate;
+				for (i = 0; i < net.num_steps; ++i)
+				{
+					if (net.steps[i] > batch_num)
+					{
+						return rate;
+					}
+					rate *= net.scales[i];
+					//if(net.steps[i] > batch_num - 1 && net.scales[i] > 1) reset_momentum(net);
+				}
+				return rate;
+			case EXP:
+				return net.learning_rate * pow(net.gamma, batch_num);
+			case POLY:
+				return net.learning_rate * pow(1 - (float)batch_num / net.max_batches, net.power);
+			case LINEAR_FINAL:
+			{
+				const float fraction = net.max_batches > 0 ? (float)batch_num / (float)net.max_batches : 1.0f;
+				return lerp(net.learning_rate, net.final_learning_rate, fraction);
+			}
+			case RANDOM:
+				return net.learning_rate * pow(rand_uniform(0.0f, 1.0f), net.power);
+			case SIG:
+				return net.learning_rate * (1./(1.+exp(net.gamma*(batch_num - net.step))));
+			case SGDR:
+			{
+				int last_iteration_start = 0;
+				int cycle_size = net.batches_per_cycle;
+				while ((last_iteration_start + cycle_size) < batch_num)
+				{
+					last_iteration_start += cycle_size;
+					cycle_size *= net.batches_cycle_mult;
+				}
+				rate = net.learning_rate_min +
+					0.5*(net.learning_rate - net.learning_rate_min)
+					* (1. + cos((float)(batch_num - last_iteration_start) * M_PI / cycle_size));
+
+				return rate;
+			}
+			default:
+				*cfg_and_state.output << "Unknown policy (" << net.policy << ")" << std::endl;
+				return net.learning_rate;
+		}
+	}
+
+	float get_warmup_fraction(const Darknet::Network & net, const int batch_num)
+	{
+		if (net.warmup_iterations <= 0 or batch_num >= net.warmup_iterations)
+		{
+			return 1.0f;
+		}
+		return (float)batch_num / (float)net.warmup_iterations;
+	}
+}
+
+
 float get_current_rate(const Darknet::Network & net)
 {
 	TAT(TATPARMS);
 
 	int batch_num = get_current_batch(net);
-	int i;
-	float rate;
+	if (net.warmup_iterations > 0 and batch_num < net.warmup_iterations)
+	{
+		const float target_rate = get_current_rate_without_warmup(net, batch_num);
+		return lerp(net.warmup_nonbias_lr_start, target_rate, get_warmup_fraction(net, batch_num));
+	}
 	if (batch_num < net.burn_in)
 	{
 		return net.learning_rate * pow((float)batch_num / net.burn_in, net.power);
 	}
+	return get_current_rate_without_warmup(net, batch_num);
+}
 
-	switch (net.policy)
+
+float get_current_bias_rate(const Darknet::Network & net)
+{
+	TAT(TATPARMS);
+
+	const int batch_num = get_current_batch(net);
+	if (net.warmup_iterations > 0 and batch_num < net.warmup_iterations)
 	{
-		case CONSTANT:
-			return net.learning_rate;
-		case STEP:
-			return net.learning_rate * pow(net.scale, batch_num/net.step);
-		case STEPS:
-			rate = net.learning_rate;
-			for (i = 0; i < net.num_steps; ++i)
-			{
-				if (net.steps[i] > batch_num)
-				{
-					return rate;
-				}
-				rate *= net.scales[i];
-				//if(net.steps[i] > batch_num - 1 && net.scales[i] > 1) reset_momentum(net);
-			}
-			return rate;
-		case EXP:
-			return net.learning_rate * pow(net.gamma, batch_num);
-		case POLY:
-			return net.learning_rate * pow(1 - (float)batch_num / net.max_batches, net.power);
-			//if (batch_num < net.burn_in) return net.learning_rate * pow((float)batch_num / net.burn_in, net.power);
-			//return net.learning_rate * pow(1 - (float)batch_num / net.max_batches, net.power);
-		case RANDOM:
-			return net.learning_rate * pow(rand_uniform(0.0f, 1.0f), net.power);
-		case SIG:
-			return net.learning_rate * (1./(1.+exp(net.gamma*(batch_num - net.step))));
-		case SGDR:
-		{
-			int last_iteration_start = 0;
-			int cycle_size = net.batches_per_cycle;
-			while ((last_iteration_start + cycle_size) < batch_num)
-			{
-				last_iteration_start += cycle_size;
-				cycle_size *= net.batches_cycle_mult;
-			}
-			rate = net.learning_rate_min +
-				0.5*(net.learning_rate - net.learning_rate_min)
-				* (1. + cos((float)(batch_num - last_iteration_start) * M_PI / cycle_size));
-
-			return rate;
-		}
-		default:
-			*cfg_and_state.output << "Unknown policy (" << net.policy << ")" << std::endl;
-			return net.learning_rate;
+		const float target_rate = get_current_rate_without_warmup(net, batch_num);
+		return lerp(net.warmup_bias_lr, target_rate, get_warmup_fraction(net, batch_num));
 	}
+	return get_current_rate(net);
+}
+
+
+float get_current_momentum(const Darknet::Network & net)
+{
+	TAT(TATPARMS);
+
+	const int batch_num = get_current_batch(net);
+	if (net.warmup_iterations > 0 and batch_num < net.warmup_iterations)
+	{
+		return lerp(net.warmup_momentum, net.momentum, get_warmup_fraction(net, batch_num));
+	}
+	return net.momentum;
 }
 
 
@@ -937,6 +1007,8 @@ void update_network(Darknet::Network & net)
 
 	int update_batch = net.batch * net.subdivisions;
 	float rate = get_current_rate(net);
+	float bias_rate = get_current_bias_rate(net);
+	float momentum = get_current_momentum(net);
 
 	for (int i = 0; i < net.n; ++i)
 	{
@@ -948,7 +1020,11 @@ void update_network(Darknet::Network & net)
 
 		if (l.update)
 		{
-			l.update(l, update_batch, rate, net.momentum, net.decay);
+			l.use_current_update_rates = 1;
+			l.current_learning_rate = rate * l.learning_rate_scale;
+			l.current_bias_learning_rate = bias_rate * l.learning_rate_scale;
+			l.update(l, update_batch, rate, momentum, net.decay);
+			l.use_current_update_rates = 0;
 		}
 	}
 }
@@ -1436,6 +1512,7 @@ int resize_network(Darknet::Network * net, int w, int h)
 			case Darknet::ELayerType::YOLOV9:			resize_yolov9_layer(&l, net);				break;
 			case Darknet::ELayerType::GAUSSIAN_YOLO:	resize_gaussian_yolo_layer(&l, w, h);		break;
 			case Darknet::ELayerType::ROUTE:			resize_route_layer(&l, net);				break;
+			case Darknet::ELayerType::CHANNEL_SLICE:	resize_channel_slice_layer(&l, net);		break;
 			case Darknet::ELayerType::SHORTCUT:			resize_shortcut_layer(&l, w, h, net);		break;
 			case Darknet::ELayerType::SCALE_CHANNELS:	resize_scale_channels_layer(&l, net);		break;
 			case Darknet::ELayerType::SAM:				resize_sam_layer(&l, w, h);					break;

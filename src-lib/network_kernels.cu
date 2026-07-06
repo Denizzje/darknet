@@ -527,6 +527,8 @@ void update_network_gpu(Darknet::Network & net)
 	int update_batch = net.batch*net.subdivisions * get_sequence_value(net);
 
 	float rate = get_current_rate(net);
+	float bias_rate = get_current_bias_rate(net);
+	float momentum = get_current_momentum(net);
 	for (int i = 0; i < net.n; ++i)
 	{
 		Darknet::Layer & l = net.layers[i];
@@ -550,7 +552,11 @@ void update_network_gpu(Darknet::Network & net)
 
 		if (l.update_gpu && l.dont_update < iteration_num)
 		{
-			l.update_gpu(l, update_batch, rate, net.momentum, net.decay, net.loss_scale);
+			l.use_current_update_rates = 1;
+			l.current_learning_rate = rate * l.learning_rate_scale;
+			l.current_bias_learning_rate = bias_rate * l.learning_rate_scale;
+			l.update_gpu(l, update_batch, rate, momentum, net.decay, net.loss_scale);
+			l.use_current_update_rates = 0;
 		}
 	}
 }
@@ -719,10 +725,16 @@ void update_layer(Darknet::Layer & l, Darknet::Network net)
 
 	int update_batch = net.batch*net.subdivisions;
 	float rate = get_current_rate(net);
+	float bias_rate = get_current_bias_rate(net);
+	float momentum = get_current_momentum(net);
 	l.t = get_current_batch(net);
 	if(l.update_gpu)
 	{
-		l.update_gpu(l, update_batch, rate, net.momentum, net.decay, net.loss_scale);
+		l.use_current_update_rates = 1;
+		l.current_learning_rate = rate * l.learning_rate_scale;
+		l.current_bias_learning_rate = bias_rate * l.learning_rate_scale;
+		l.update_gpu(l, update_batch, rate, momentum, net.decay, net.loss_scale);
+		l.use_current_update_rates = 0;
 	}
 }
 

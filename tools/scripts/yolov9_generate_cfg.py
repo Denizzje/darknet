@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Generate Darknet cfg files for the YOLOv9/GELAN detection topologies.
 
-The generator intentionally supports the small detection model family used by
-the local YOLOv9 training plan: GELAN-t/s and YOLOv9-t/s.  It reads the
+The generator supports the non-cf YOLOv9/GELAN detection family.  It reads the
 reference YAML topology, expands modules into current Darknet primitives, and
 tracks tensor shapes while generating the cfg so bad routes fail early.
 """
@@ -10,11 +9,14 @@ tracks tensor shapes while generating the cfg so bad routes fail early.
 from __future__ import annotations
 
 import argparse
+import difflib
 import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+from yolov9_recipe import CompiledRecipe, compile_recipe, dump_manifest, recipe_names
 
 try:
 	import yaml
@@ -25,7 +27,20 @@ except ImportError:  # pragma: no cover - exercised only on minimal Python envs
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REFERENCE_DIR = ROOT / "reference_yolov9_repo" / "yolov9" / "models" / "detect"
 DEFAULT_OUTPUT_DIR = ROOT / "cfg"
-DEFAULT_MODELS = ("gelan-t", "gelan-s", "yolov9-t", "yolov9-s")
+DEFAULT_MODELS = (
+	"gelan",
+	"gelan-t",
+	"gelan-s",
+	"gelan-m",
+	"gelan-c",
+	"gelan-e",
+	"yolov9",
+	"yolov9-t",
+	"yolov9-s",
+	"yolov9-m",
+	"yolov9-c",
+	"yolov9-e",
+)
 REG_MAX = 16
 BOX_LOGIT_CHANNELS = 4 * REG_MAX
 
@@ -53,10 +68,26 @@ class Profile:
 	height: int
 	batch: int
 	subdivisions: int
+	burn_in: int
 	max_batches: int
-	steps: tuple[int, int]
+	learning_rate: str = "0.00261"
+	momentum: str = "0.9"
+	decay: str = "0.0005"
+	policy: str = "steps"
+	steps: tuple[int, int] | None = None
+	scales: str | None = ".1,.1"
+	power: int | None = None
+	flip: int = 0
+	mosaic: int = 0
+	hue: str = ".1"
+	saturation: str = "1.5"
+	exposure: str = "1.5"
+	max_chart_loss: int | None = None
 	dataset_comment: str | None = None
 	training_gate: str | None = None
+	train_images: int | None = None
+	epochs: int | None = None
+	close_mosaic_epochs: int | None = None
 
 
 PROFILES: Mapping[str, Profile] = {
@@ -68,9 +99,14 @@ PROFILES: Mapping[str, Profile] = {
 		height=640,
 		batch=64,
 		subdivisions=1,
+		burn_in=1000,
 		max_batches=2000200,
+		learning_rate="0.00261",
 		steps=(1600000, 1800000),
 		dataset_comment="COCO-style 80-class detector defaults.",
+		train_images=118287,
+		epochs=500,
+		close_mosaic_epochs=15,
 	),
 	"legogears": Profile(
 		name="legogears",
@@ -80,10 +116,105 @@ PROFILES: Mapping[str, Profile] = {
 		height=160,
 		batch=64,
 		subdivisions=1,
+		burn_in=1000,
 		max_batches=3000,
+		learning_rate="0.00261",
 		steps=(2400, 2700),
 		dataset_comment="test_training_set/LegoGears_v2/LegoGears.local.data",
 		training_gate="./darknet detector train test_training_set/LegoGears_v2/LegoGears.local.data {cfg_path} -dont_show -map",
+		train_images=100,
+		epochs=30,
+		close_mosaic_epochs=5,
+	),
+	"ccr": Profile(
+		name="ccr",
+		suffix="-ccr-mailboxes-b64-640",
+		classes=17,
+		width=640,
+		height=640,
+		batch=64,
+		subdivisions=1,
+		burn_in=261,
+		max_batches=2610,
+		learning_rate="0.00261",
+		steps=(2088, 2349),
+		max_chart_loss=6,
+		dataset_comment="test_training_set/ccr_mailboxes/mailboxes.data sample dataset.",
+		training_gate="./build/src-cli/darknet detector train test_training_set/ccr_mailboxes/mailboxes.data {cfg_path} -dont_show -map",
+		train_images=5552,
+		epochs=30,
+		close_mosaic_epochs=5,
+	),
+	"beverage": Profile(
+		name="beverage",
+		suffix="-beverage-b64-640",
+		classes=9,
+		width=640,
+		height=640,
+		batch=64,
+		subdivisions=1,
+		burn_in=1000,
+		max_batches=10000,
+		learning_rate="0.00261",
+		steps=(8000, 9000),
+		max_chart_loss=6,
+		dataset_comment="test_training_set/Beverage_Containers at native 640x640.",
+		training_gate="./build-gpu/src-cli/darknet detector train training_runs/beverage_containers_640_profile/<model>/beverage_containers.data {cfg_path} -dont_show",
+		train_images=2630,
+		epochs=30,
+		close_mosaic_epochs=5,
+	),
+	"darknet_baseline": Profile(
+		name="darknet_baseline",
+		suffix="-beverage-darknet-baseline-b64-640",
+		classes=9,
+		width=640,
+		height=640,
+		batch=64,
+		subdivisions=1,
+		burn_in=1000,
+		max_batches=20000,
+		learning_rate="0.00261",
+		momentum="0.9",
+		decay="0.0005",
+		policy="steps",
+		steps=(16000, 18000),
+		scales=".1,.1",
+		max_chart_loss=6,
+		dataset_comment="Beverage 20k comparison: Darknet baseline recipe at native 640x640.",
+		training_gate="./build-gpu/src-cli/darknet detector train training_runs/beverage_containers_640_profile/<model>/beverage_containers.data {cfg_path} -dont_show",
+		train_images=2630,
+		epochs=30,
+		close_mosaic_epochs=5,
+	),
+	"yolov9_reference_scratch": Profile(
+		name="yolov9_reference_scratch",
+		suffix="-beverage-yolov9-reference-scratch-b64-640",
+		classes=9,
+		width=640,
+		height=640,
+		batch=64,
+		subdivisions=1,
+		burn_in=642,
+		max_batches=20000,
+		learning_rate="0.01",
+		momentum="0.937",
+		decay="0.0005",
+		policy="poly",
+		steps=None,
+		scales=None,
+		power=1,
+		flip=1,
+		mosaic=1,
+		hue=".015",
+		saturation="1.7",
+		exposure="1.4",
+		max_chart_loss=6,
+		dataset_comment="Beverage 20k comparison: YOLOv9 reference-from-scratch approximation at native 640x640.",
+		training_gate="./build-gpu/src-cli/darknet detector train training_runs/beverage_containers_640_profile/<model>/beverage_containers.data {cfg_path} -dont_show",
+		train_images=2630,
+		epochs=30,
+		close_mosaic_epochs=5,
 	),
 }
 
@@ -141,14 +272,41 @@ def format_args(args: Sequence[Any]) -> str:
 	return "[" + ", ".join(repr(arg) for arg in args) + "]"
 
 
+def activation_from_reference(value: Any) -> str:
+	if value is None:
+		return "swish"
+	text = str(value)
+	if "LeakyReLU" in text:
+		return "leaky"
+	if "ReLU" in text:
+		return "relu"
+	if "SiLU" in text or "Swish" in text:
+		return "swish"
+	raise GenerateError(f"unsupported reference activation {value!r}")
+
+
 class CfgBuilder:
-	def __init__(self, *, model: str, profile: Profile, source_yaml: Path) -> None:
+	def __init__(
+		self,
+		*,
+		model: str,
+		profile: Profile,
+		recipe: CompiledRecipe,
+		source_yaml: Path,
+		manifest_path: Path,
+		deploy: bool = False,
+		default_activation: str = "swish",
+	) -> None:
 		self.model = model
 		self.profile = profile
+		self.recipe = recipe
 		self.source_yaml = source_yaml
+		self.manifest_path = manifest_path
+		self.deploy = deploy
+		self.default_activation = default_activation
 		self.sections: list[Section] = []
 		self.current_shape = Shape(profile.width, profile.height, 3)
-		self.yaml_outputs: dict[int, int] = {}
+		self.yaml_outputs: dict[int, int | list[int]] = {}
 		self.mapping_notes: list[str] = []
 
 		if profile.width % 32 != 0 or profile.height % 32 != 0:
@@ -188,9 +346,11 @@ class CfgBuilder:
 		stride: int = 1,
 		groups: int = 1,
 		batch_normalize: bool = True,
-		activation: str = "swish",
+		activation: str | None = None,
 		comment: str | None = None,
 	) -> int:
+		if activation is None:
+			activation = self.default_activation
 		if filters <= 0:
 			raise GenerateError(f"convolution filters must be positive, got {filters}")
 		if size <= 0 or stride <= 0:
@@ -303,7 +463,43 @@ class CfgBuilder:
 			comment,
 		)
 
+	def channel_slice(
+		self,
+		from_layer: int,
+		*,
+		channel_start: int,
+		channel_count: int,
+		comment: str | None = None,
+	) -> int:
+		source_shape = self.section_shape(from_layer)
+		if channel_start < 0:
+			raise GenerateError(f"channel_slice channel_start must be non-negative, got {channel_start}")
+		if channel_count <= 0:
+			raise GenerateError(f"channel_slice channel_count must be positive, got {channel_count}")
+		if channel_start + channel_count > source_shape.c:
+			raise GenerateError(
+				f"channel_slice {channel_start}:{channel_start + channel_count} exceeds "
+				f"source layer {from_layer} channels={source_shape.c}")
+		return self.add_section(
+			"channel_slice",
+			[
+				("from", from_layer),
+				("channel_start", channel_start),
+				("channel_count", channel_count),
+			],
+			Shape(source_shape.w, source_shape.h, channel_count),
+			comment,
+		)
+
 	def resolve_source(self, source: int, yaml_idx: int) -> int | None:
+		output = self.resolve_output(source, yaml_idx)
+		if isinstance(output, list):
+			raise GenerateError(
+				f"YAML layer {yaml_idx} references multi-output YAML source {source}; "
+				"only CBFuse may consume CBLinear outputs")
+		return output
+
+	def resolve_output(self, source: int, yaml_idx: int) -> int | list[int] | None:
 		if source == -1:
 			last = self.last_idx()
 			if last is None:
@@ -314,6 +510,16 @@ class CfgBuilder:
 		if source not in self.yaml_outputs:
 			raise GenerateError(f"YAML layer {yaml_idx} references unavailable source {source}")
 		return self.yaml_outputs[source]
+
+	def resolve_cblinear_split(self, source: int, split_idx: int, yaml_idx: int) -> int:
+		output = self.resolve_output(source, yaml_idx)
+		if not isinstance(output, list):
+			raise GenerateError(f"YAML layer {yaml_idx} CBFuse source {source} is not a CBLinear output")
+		if split_idx < 0 or split_idx >= len(output):
+			raise GenerateError(
+				f"YAML layer {yaml_idx} CBFuse split index {split_idx} is outside "
+				f"CBLinear source {source} split count {len(output)}")
+		return output[split_idx]
 
 	def ensure_source(self, source: int, yaml_idx: int, *, comment: str) -> None:
 		source_idx = self.resolve_source(source, yaml_idx)
@@ -340,6 +546,27 @@ class CfgBuilder:
 		self.local_avgpool(comment=f"YAML {yaml_idx} AConv pre-pool")
 		return self.conv(int(args[0]), size=3, stride=2, comment=f"YAML {yaml_idx} AConv conv {format_args(args)}")
 
+	def add_adown_module(self, yaml_idx: int, source: int, args: Sequence[Any]) -> int:
+		if len(args) != 1:
+			raise GenerateError(f"YAML {yaml_idx} ADown expects [channels], got {args!r}")
+		channels = int(args[0])
+		if channels % 2 != 0:
+			raise GenerateError(f"YAML {yaml_idx} ADown output channels must be even, got {channels}")
+		self.ensure_source(source, yaml_idx, comment=f"route YAML {source} for YAML {yaml_idx} ADown")
+		self.local_avgpool(comment=f"YAML {yaml_idx} ADown pre-pool")
+		pooled = self.last_idx()
+		assert pooled is not None
+		pooled_shape = self.section_shape(pooled)
+		if pooled_shape.c % 2 != 0:
+			raise GenerateError(
+				f"YAML {yaml_idx} ADown input channels must split evenly, got {pooled_shape.c}")
+		x1 = self.route([pooled], groups=2, group_id=0, comment=f"YAML {yaml_idx} ADown chunk 0")
+		x1 = self.conv(channels // 2, size=3, stride=2, comment=f"YAML {yaml_idx} ADown cv1")
+		self.route([pooled], groups=2, group_id=1, comment=f"YAML {yaml_idx} ADown chunk 1")
+		self.maxpool(size=3, stride=2, comment=f"YAML {yaml_idx} ADown maxpool")
+		x2 = self.conv(channels // 2, size=1, comment=f"YAML {yaml_idx} ADown cv2")
+		return self.route([x1, x2], comment=f"YAML {yaml_idx} ADown concat")
+
 	def add_elan1_module(self, yaml_idx: int, source: int, args: Sequence[Any]) -> int:
 		if len(args) != 3:
 			raise GenerateError(f"YAML {yaml_idx} ELAN1 expects [c2, c3, c4], got {args!r}")
@@ -357,12 +584,21 @@ class CfgBuilder:
 		input_idx = self.last_idx()
 		if input_idx is None:
 			raise GenerateError("RepConvN cannot consume net input directly")
+		if self.deploy:
+			return self.conv(
+				c2,
+				size=3,
+				groups=groups,
+				batch_normalize=False,
+				activation=self.default_activation,
+				comment=f"{prefix} RepConvN deploy fused 3x3",
+			)
 		self.conv(c2, size=3, groups=groups, activation="linear", comment=f"{prefix} RepConvN conv1 3x3")
 		conv1 = self.last_idx()
 		assert conv1 is not None
 		self.route([input_idx], comment=f"{prefix} RepConvN conv2 input")
 		self.conv(c2, size=1, groups=groups, activation="linear", comment=f"{prefix} RepConvN conv2 1x1")
-		return self.shortcut(conv1, activation="swish", comment=f"{prefix} RepConvN conv1+conv2")
+		return self.shortcut(conv1, activation=self.default_activation, comment=f"{prefix} RepConvN conv1+conv2")
 
 	def add_repnbottleneck(self, c2: int, *, prefix: str, shortcut: bool = True, groups: int = 1) -> int:
 		input_idx = self.last_idx()
@@ -429,6 +665,88 @@ class CfgBuilder:
 				raise GenerateError(f"YAML {yaml_idx} Concat cannot use net input directly")
 			layers.append(resolved)
 		return self.route(layers, comment=f"YAML {yaml_idx} Concat from {list(sources)}")
+
+	def add_silence_module(self, yaml_idx: int, source: int, args: Sequence[Any]) -> int:
+		if args:
+			raise GenerateError(f"YAML {yaml_idx} Silence expects no args, got {args!r}")
+		self.ensure_source(source, yaml_idx, comment=f"route YAML {source} for YAML {yaml_idx} Silence")
+		return self.maxpool(size=1, stride=1, comment=f"YAML {yaml_idx} Silence identity")
+
+	def add_cblinear_module(self, yaml_idx: int, source: int, args: Sequence[Any]) -> list[int]:
+		if not args or not isinstance(args[0], list) or not args[0]:
+			raise GenerateError(f"YAML {yaml_idx} CBLinear expects first arg to be a non-empty channel list")
+		channel_counts = [int(value) for value in args[0]]
+		if any(value <= 0 for value in channel_counts):
+			raise GenerateError(f"YAML {yaml_idx} CBLinear split channels must all be positive")
+		size = int(args[1]) if len(args) > 1 else 1
+		stride = int(args[2]) if len(args) > 2 else 1
+		if len(args) > 3 and args[3] is not None:
+			raise GenerateError(f"YAML {yaml_idx} CBLinear custom padding is not supported by this generator")
+		groups = int(args[4]) if len(args) > 4 else 1
+		self.ensure_source(source, yaml_idx, comment=f"route YAML {source} for YAML {yaml_idx} CBLinear")
+		conv = self.conv(
+			sum(channel_counts),
+			size=size,
+			stride=stride,
+			groups=groups,
+			batch_normalize=False,
+			activation="linear",
+			comment=f"YAML {yaml_idx} CBLinear conv {format_args(args)}",
+		)
+		slices: list[int] = []
+		channel_start = 0
+		for split_idx, channel_count in enumerate(channel_counts):
+			slices.append(
+				self.channel_slice(
+					conv,
+					channel_start=channel_start,
+					channel_count=channel_count,
+					comment=f"YAML {yaml_idx} CBLinear split {split_idx}",
+				)
+			)
+			channel_start += channel_count
+		return slices
+
+	def add_cbfuse_module(self, yaml_idx: int, sources: Sequence[int], args: Sequence[Any]) -> int:
+		if len(args) != 1 or not isinstance(args[0], list):
+			raise GenerateError(f"YAML {yaml_idx} CBFuse expects [[split_indexes]], got {args!r}")
+		split_indexes = [int(value) for value in args[0]]
+		if len(split_indexes) != len(sources) - 1:
+			raise GenerateError(
+				f"YAML {yaml_idx} CBFuse split index count {len(split_indexes)} does not match "
+				f"CBLinear source count {len(sources) - 1}")
+		target = self.resolve_source(sources[-1], yaml_idx)
+		if target is None:
+			raise GenerateError(f"YAML {yaml_idx} CBFuse cannot use net input as target")
+		target_shape = self.section_shape(target)
+		accum = self.route([target], comment=f"YAML {yaml_idx} CBFuse target from YAML {sources[-1]}")
+		for source, split_idx in zip(sources[:-1], split_indexes):
+			selected = self.resolve_cblinear_split(source, split_idx, yaml_idx)
+			selected_shape = self.section_shape(selected)
+			resized = selected
+			if selected_shape.w != target_shape.w or selected_shape.h != target_shape.h:
+				if selected_shape.w <= 0 or selected_shape.h <= 0:
+					raise GenerateError(f"YAML {yaml_idx} CBFuse selected split has invalid spatial shape")
+				if target_shape.w % selected_shape.w != 0 or target_shape.h % selected_shape.h != 0:
+					raise GenerateError(
+						f"YAML {yaml_idx} CBFuse cannot resize split {selected_shape.describe()} "
+						f"to target {target_shape.describe()} by integer nearest upsample")
+				scale_w = target_shape.w // selected_shape.w
+				scale_h = target_shape.h // selected_shape.h
+				if scale_w != scale_h or scale_w <= 0:
+					raise GenerateError(
+						f"YAML {yaml_idx} CBFuse unsupported resize factor {scale_w}x{scale_h}")
+				self.route([selected], comment=f"YAML {yaml_idx} CBFuse split from YAML {source}[{split_idx}]")
+				resized = self.upsample(stride=scale_w, comment=f"YAML {yaml_idx} CBFuse upsample x{scale_w}")
+			resized_shape = self.section_shape(resized)
+			if resized_shape != target_shape:
+				raise GenerateError(
+					f"YAML {yaml_idx} CBFuse split shape {resized_shape.describe()} does not match "
+					f"target {target_shape.describe()}")
+			if self.last_idx() != accum:
+				self.route([accum], comment=f"YAML {yaml_idx} CBFuse restore accumulated sum")
+			accum = self.shortcut(resized, activation="linear", comment=f"YAML {yaml_idx} CBFuse add YAML {source}[{split_idx}]")
+		return accum
 
 	def add_upsample_module(self, yaml_idx: int, source: int, args: Sequence[Any]) -> int:
 		if len(args) < 2:
@@ -592,7 +910,7 @@ class CfgBuilder:
 		if not isinstance(args, list):
 			raise GenerateError(f"YAML layer {yaml_idx} args must be a list, got {args!r}")
 
-		if module in {"Concat", "DDetect", "DualDDetect"}:
+		if module in {"Concat", "DDetect", "DualDDetect", "CBFuse"}:
 			sources = as_int_list(source, context=f"YAML {yaml_idx} {module} sources")
 		elif isinstance(source, int):
 			sources = [source]
@@ -603,12 +921,20 @@ class CfgBuilder:
 			out_idx = self.add_conv_module(yaml_idx, sources[0], args)
 		elif module == "AConv":
 			out_idx = self.add_aconv_module(yaml_idx, sources[0], args)
+		elif module == "ADown":
+			out_idx = self.add_adown_module(yaml_idx, sources[0], args)
+		elif module == "Silence":
+			out_idx = self.add_silence_module(yaml_idx, sources[0], args)
 		elif module == "ELAN1":
 			out_idx = self.add_elan1_module(yaml_idx, sources[0], args)
 		elif module == "RepNCSPELAN4":
 			out_idx = self.add_repncspelan4_module(yaml_idx, sources[0], args)
 		elif module == "SPPELAN":
 			out_idx = self.add_sppelan_module(yaml_idx, sources[0], args)
+		elif module == "CBLinear":
+			out_idx = self.add_cblinear_module(yaml_idx, sources[0], args)
+		elif module == "CBFuse":
+			out_idx = self.add_cbfuse_module(yaml_idx, sources, args)
 		elif module == "nn.Upsample":
 			out_idx = self.add_upsample_module(yaml_idx, sources[0], args)
 		elif module == "Concat":
@@ -622,7 +948,7 @@ class CfgBuilder:
 
 	def net_block(self) -> list[str]:
 		p = self.profile
-		return [
+		lines = [
 			"[net]",
 			"# Testing",
 			"#batch=1",
@@ -633,35 +959,33 @@ class CfgBuilder:
 			f"width={p.width}",
 			f"height={p.height}",
 			"channels=3",
-			"momentum=0.9",
-			"decay=0.0005",
-			"angle=0",
-			"saturation = 1.5",
-			"exposure = 1.5",
-			"hue=.1",
-			"",
-			"learning_rate=0.00261",
-			"burn_in=1000",
-			f"max_batches={p.max_batches}",
-			"policy=steps",
-			f"steps={p.steps[0]},{p.steps[1]}",
-			"scales=.1,.1",
-			"",
-			"cutmix=0",
-			"flip=0",
-			"mixup=0",
-			"mosaic=0",
-			"use_cuda_graph=0",
 		]
+		inserted_blank = False
+		for key, value in self.recipe.net_options:
+			if not inserted_blank and key == "learning_rate":
+				lines.append("")
+				inserted_blank = True
+			lines.append(f"{key}={value}")
+		if p.max_chart_loss is not None:
+			lines.append(f"max_chart_loss={p.max_chart_loss}")
+		return lines
 
 	def render(self, output_path: Path) -> str:
 		source = self.source_yaml.relative_to(ROOT).as_posix()
 		generator = Path(__file__).resolve().relative_to(ROOT).as_posix()
+		manifest = self.manifest_path.relative_to(ROOT).as_posix()
 		lines = [
-			f"# Generated Darknet cfg for {self.model} ({self.profile.name}).",
+			f"# Generated Darknet cfg for {self.model} ({self.profile.name}{', deploy' if self.deploy else ''}).",
 			f"# Generator: {generator}",
 			f"# Source topology: {source}",
+			f"# Recipe: {self.recipe.name}",
+			f"# Recipe description: {self.recipe.description}",
+			f"# Manifest: {manifest}",
 		]
+		if self.recipe.sources:
+			lines.append("# Recipe sources:")
+			for recipe_source in self.recipe.sources:
+				lines.append(f"#   - {recipe_source}")
 		if self.profile.dataset_comment:
 			lines.append(f"# Dataset/defaults: {self.profile.dataset_comment}")
 		if self.profile.training_gate:
@@ -670,10 +994,20 @@ class CfgBuilder:
 		lines.extend([
 			"#",
 			"# Mapping notes:",
-			"# - Conv, AConv, SPPELAN, routes, upsample, maxpool, and final [yolov9] use native Darknet layers.",
-			"# - RepNCSPELAN4 expands RepNCSP/RepNBottleneck/RepConvN train-time branches with route+shortcut sums.",
+			"# - Conv, AConv, ADown, SPPELAN, routes, upsample, maxpool, and final [yolov9] use native Darknet layers.",
+			"# - RepNCSPELAN4 expands RepNCSP/RepNBottleneck/RepConvN train-time branches with route+shortcut sums."
+			if not self.deploy else
+			"# - Deploy mode fuses each RepConvN train-time 3x3+1x1 branch pair into one biased 3x3 convolution.",
 			"# - DDetect/DualDDetect heads are expanded into box/class conv branches before the final [yolov9] layer.",
+			"# - Silence lowers to a size-1 maxpool identity; CBLinear lowers to a biased conv plus channel_slice splits.",
+			"# - CBFuse lowers to nearest upsample plus shortcut sums against the target branch.",
 		])
+		approx = [
+			name for name, field in self.recipe.manifest_augmentation.items()
+			if str(field.get("status", "")).startswith(("approximate", "unsupported", "mapped_to_darknet", "needs code"))
+		]
+		if approx:
+			lines.append(f"# - Augmentation manifest labels unfinished runtime mappings for: {', '.join(approx)}.")
 		if self.model.startswith("yolov9"):
 			lines.append("# - DualDDetect order is aux A3/A4/A5 first, main P3/P4/P5 second; inference_branch=1.")
 		lines.append("")
@@ -685,14 +1019,96 @@ class CfgBuilder:
 		return "\n".join(lines)
 
 
-def build_cfg(model: str, profile: Profile, reference_dir: Path, output_path: Path) -> str:
+@dataclass(frozen=True)
+class GeneratedArtifact:
+	cfg_path: Path
+	cfg_text: str
+	manifest_path: Path
+	manifest_text: str
+
+
+def profile_suffix_for_recipe(profile: Profile, recipe: CompiledRecipe) -> str:
+	if recipe.name == "legacy_darknet_comparison":
+		return profile.suffix
+	if profile.name == "coco":
+		return "-coco-b64-640"
+	return profile.suffix
+
+
+def build_manifest(
+	*,
+	model: str,
+	profile: Profile,
+	recipe: CompiledRecipe,
+	source_yaml: Path,
+	cfg_path: Path,
+	deploy: bool,
+) -> dict[str, Any]:
+	return {
+		"model": model,
+		"source_topology": source_yaml.relative_to(ROOT).as_posix(),
+		"cfg": cfg_path.relative_to(ROOT).as_posix(),
+		"recipe_name": recipe.name,
+		"created_by": Path(__file__).resolve().relative_to(ROOT).as_posix(),
+		"deploy": deploy,
+		"input_size": [profile.width, profile.height],
+		"batch": profile.batch,
+		"subdivisions": profile.subdivisions,
+		"classes": profile.classes,
+		"dataset_profile": {
+			"name": profile.name,
+			"train_images": profile.train_images,
+			"comment": profile.dataset_comment,
+		},
+		"training": recipe.manifest_training,
+		"loss": recipe.manifest_loss,
+		"augmentation": recipe.manifest_augmentation,
+	}
+
+
+def build_artifact(
+	model: str,
+	profile: Profile,
+	recipe_name: str,
+	reference_dir: Path,
+	output_dir: Path,
+	*,
+	deploy: bool = False,
+) -> GeneratedArtifact:
 	source_yaml = reference_dir / f"{model}.yaml"
 	data = load_reference_yaml(source_yaml)
-	builder = CfgBuilder(model=model, profile=profile, source_yaml=source_yaml)
+	recipe = compile_recipe(recipe_name, profile, ROOT)
+	default_activation = activation_from_reference(data.get("activation"))
+	deploy_suffix = "-deploy" if deploy else ""
+	cfg_path = output_dir / f"{model}{recipe.output_suffix}{profile_suffix_for_recipe(profile, recipe)}{deploy_suffix}.cfg"
+	manifest_path = output_dir / "manifests" / f"{cfg_path.stem}.recipe.yaml"
+	builder = CfgBuilder(
+		model=model,
+		profile=profile,
+		recipe=recipe,
+		source_yaml=source_yaml,
+		manifest_path=manifest_path,
+		deploy=deploy,
+		default_activation=default_activation,
+	)
 	raw_layers = list(data["backbone"]) + list(data["head"])
 	for yaml_idx, raw in enumerate(raw_layers):
 		builder.add_yaml_layer(yaml_idx, raw)
-	return builder.render(output_path)
+	cfg_text = builder.render(cfg_path)
+	manifest = build_manifest(
+		model=model,
+		profile=profile,
+		recipe=recipe,
+		source_yaml=source_yaml,
+		cfg_path=cfg_path,
+		deploy=deploy,
+	)
+	return GeneratedArtifact(
+		cfg_path=cfg_path,
+		cfg_text=cfg_text,
+		manifest_path=manifest_path,
+		manifest_text=dump_manifest(manifest),
+	)
 
 
 def write_if_changed(path: Path, content: str) -> bool:
@@ -701,6 +1117,30 @@ def write_if_changed(path: Path, content: str) -> bool:
 	path.parent.mkdir(parents=True, exist_ok=True)
 	path.write_text(content, encoding="utf-8")
 	return True
+
+
+def check_file(path: Path, expected: str) -> bool:
+	if not path.exists():
+		print(f"missing {path.relative_to(ROOT)}")
+		return False
+	actual = path.read_text(encoding="utf-8")
+	if actual == expected:
+		print(f"checked {path.relative_to(ROOT)}")
+		return True
+	print(f"stale {path.relative_to(ROOT)}")
+	diff = difflib.unified_diff(
+		actual.splitlines(),
+		expected.splitlines(),
+		fromfile=str(path.relative_to(ROOT)),
+		tofile=f"{path.relative_to(ROOT)} (generated)",
+		lineterm="",
+	)
+	for idx, line in enumerate(diff):
+		if idx >= 160:
+			print("... diff truncated ...")
+			break
+		print(line)
+	return False
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -716,11 +1156,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		"--profiles",
 		nargs="+",
 		choices=tuple(PROFILES),
-		default=list(PROFILES),
+		default=["coco"],
 		help="profile variants to generate",
 	)
+	parser.add_argument("--recipe", choices=recipe_names(), default="paper_500e_close15", help="training recipe to render")
+	parser.add_argument("--write", action="store_true", help="write generated cfgs and manifests (default unless --check-only)")
 	parser.add_argument("--reference-dir", type=Path, default=DEFAULT_REFERENCE_DIR, help="directory containing reference YAML files")
 	parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="cfg output directory")
+	parser.add_argument("--deploy", action="store_true", help="generate GELAN deploy cfgs with RepConvN branches fused into single convolutions")
 	parser.add_argument("--check-only", action="store_true", help="generate and validate in memory without writing cfg files")
 	return parser
 
@@ -730,18 +1173,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 	args = parser.parse_args(argv)
 
 	try:
+		all_ok = True
 		for model in args.models:
+			if args.deploy and not model.startswith("gelan-"):
+				raise GenerateError("--deploy is currently supported for GELAN DDetect models only")
 			for profile_name in args.profiles:
 				profile = PROFILES[profile_name]
-				output_path = args.output_dir / f"{model}{profile.suffix}.cfg"
-				content = build_cfg(model, profile, args.reference_dir, output_path)
+				artifact = build_artifact(model, profile, args.recipe, args.reference_dir, args.output_dir, deploy=args.deploy)
 				if args.check_only:
-					print(f"checked {output_path.relative_to(ROOT)}")
+					cfg_ok = check_file(artifact.cfg_path, artifact.cfg_text)
+					manifest_ok = check_file(artifact.manifest_path, artifact.manifest_text)
+					all_ok = all_ok and cfg_ok and manifest_ok
 					continue
-				changed = write_if_changed(output_path, content)
+				changed = write_if_changed(artifact.cfg_path, artifact.cfg_text)
 				verb = "wrote" if changed else "unchanged"
-				print(f"{verb} {output_path.relative_to(ROOT)}")
+				print(f"{verb} {artifact.cfg_path.relative_to(ROOT)}")
+				manifest_changed = write_if_changed(artifact.manifest_path, artifact.manifest_text)
+				manifest_verb = "wrote" if manifest_changed else "unchanged"
+				print(f"{manifest_verb} {artifact.manifest_path.relative_to(ROOT)}")
+		if args.check_only and not all_ok:
+			return 2
 	except GenerateError as exc:
+		print(f"error: {exc}", file=sys.stderr)
+		return 1
+	except (KeyError, RuntimeError) as exc:
 		print(f"error: {exc}", file=sys.stderr)
 		return 1
 	return 0

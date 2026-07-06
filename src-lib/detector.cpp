@@ -369,6 +369,20 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 		show_imgs = 2;
 	}
 	args.show_imgs = show_imgs;
+	args.augment_policy = net.augment_policy;
+	args.hsv_h = net.hsv_h;
+	args.hsv_s = net.hsv_s;
+	args.hsv_v = net.hsv_v;
+	args.degrees = net.degrees;
+	args.translate = net.translate;
+	args.yolov9_scale = net.yolov9_scale;
+	args.shear = net.shear;
+	args.perspective = net.perspective;
+	args.flipud_prob = net.flipud_prob;
+	args.fliplr_prob = net.fliplr_prob;
+	args.mosaic_prob = net.mosaic_prob;
+	args.mixup_prob = net.mixup_prob;
+	args.copy_paste_prob = net.copy_paste_prob;
 	args.threads = 6 * ngpus;   // 3 for - Amazon EC2 Tesla V100: p3.2xlarge (8 logical cores) - p3.16xlarge
 
 	// This is where we draw the initial blank chart.  That chart is then updated by update_train_loss_chart() at every iteration.
@@ -380,6 +394,64 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 	{
 		args.threads = net.batch / 2;
 	}
+
+	auto effective_close_mosaic_iteration = [&]() -> int
+	{
+		if (net.close_mosaic_iteration > 0)
+		{
+			return net.close_mosaic_iteration;
+		}
+		if (net.close_mosaic_epochs > 0 and train_images_num > 0 and imgs > 0)
+		{
+			const int updates_per_epoch = std::max(1, (train_images_num + imgs - 1) / imgs);
+			net.close_mosaic_iteration = std::max(0, net.max_batches - net.close_mosaic_epochs * updates_per_epoch);
+			return net.close_mosaic_iteration;
+		}
+		return 0;
+	};
+
+	auto configure_mosaic_for_loaded_iteration = [&](const int iteration_to_load)
+	{
+		const int close_iteration = effective_close_mosaic_iteration();
+		if (close_iteration > 0 and iteration_to_load >= close_iteration)
+		{
+			const bool mosaic_enabled = (args.augment_policy == 1) ? args.mosaic_prob > 0.0f : args.mixup != 0;
+			if (mosaic_enabled and net.close_mosaic_logged == 0)
+			{
+				*cfg_and_state.output
+					<< "Disabling mosaic for close_mosaic at iteration #"
+					<< iteration_to_load
+					<< " (boundary #" << close_iteration << ")."
+					<< std::endl;
+				net.close_mosaic_logged = 1;
+			}
+			if (args.augment_policy == 1)
+			{
+				args.mosaic_prob = 0.0f;
+			}
+			else
+			{
+				args.mixup = 0;
+			}
+		}
+		else
+		{
+			if (args.augment_policy == 1)
+			{
+				args.mosaic_prob = net.mosaic_prob;
+			}
+			else
+			{
+				args.mixup = net.mixup;
+			}
+		}
+	};
+
+	auto launch_image_loading_thread = [&](const int iteration_to_load)
+	{
+		configure_mosaic_for_loaded_iteration(iteration_to_load);
+		return std::thread(Darknet::run_image_loading_control_thread, args);
+	};
 
 	if (net.track)
 	{
@@ -406,7 +478,7 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 
 	const auto first_iteration = get_current_iteration(net); // normally this is zero unless we're resuming training
 	const auto start_of_training = std::chrono::high_resolution_clock::now();
-	std::thread load_thread = std::thread(Darknet::run_image_loading_control_thread, args);
+	std::thread load_thread = launch_image_loading_thread(first_iteration);
 	int count = 0;
 
 	// ***************************************
@@ -498,7 +570,7 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 			load_thread.join();
 			train = buffer;
 			Darknet::free_data(train);
-			load_thread = std::thread(Darknet::run_image_loading_control_thread, args);
+			load_thread = launch_image_loading_thread(get_current_iteration(net));
 
 			for (int k = 0; k < ngpus; ++k)
 			{
@@ -520,7 +592,7 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 				<< std::endl;
 		}
 
-		load_thread = std::thread(Darknet::run_image_loading_control_thread, args);
+		load_thread = launch_image_loading_thread(get_current_iteration(net) + 1);
 
 		const auto train_start_time = std::chrono::high_resolution_clock::now();
 		float loss = 0.0f;
@@ -646,7 +718,7 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 				load_thread.join();
 				Darknet::free_data(train);
 				train = buffer;
-				load_thread = std::thread(Darknet::run_image_loading_control_thread, args);
+				load_thread = launch_image_loading_thread(get_current_iteration(net) + 1);
 
 				for (int k = 0; k < ngpus; ++k)
 				{

@@ -200,7 +200,8 @@ typedef enum
 	STEPS,
 	SIG,
 	RANDOM,
-	SGDR
+	SGDR,
+	LINEAR_FINAL
 } learning_rate_policy;
 
 
@@ -295,11 +296,25 @@ typedef struct load_args {
 	int gaussian_noise;
 	int blur;
 	int mixup;
+	int augment_policy;
 	float angle;
 	float aspect;
 	float saturation;
 	float exposure;
 	float hue;
+	float hsv_h;
+	float hsv_s;
+	float hsv_v;
+	float degrees;
+	float translate;
+	float yolov9_scale;
+	float shear;
+	float perspective;
+	float flipud_prob;
+	float fliplr_prob;
+	float mosaic_prob;
+	float mixup_prob;
+	float copy_paste_prob;
 	data *d;
 	Darknet::Image *im;
 	Darknet::Image *resized;

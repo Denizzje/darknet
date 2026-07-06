@@ -239,6 +239,7 @@ namespace Darknet
 			CfgFile &		parse_net_section			();
 			Darknet::Layer	parse_convolutional_section	(const size_t section_idx);
 			Darknet::Layer	parse_route_section			(const size_t section_idx);
+			Darknet::Layer	parse_channel_slice_section	(const size_t section_idx);
 			Darknet::Layer	parse_maxpool_section		(const size_t section_idx);
 			Darknet::Layer	parse_yolo_section			(const size_t section_idx);
 			Darknet::Layer	parse_yolov9_section		(const size_t section_idx);

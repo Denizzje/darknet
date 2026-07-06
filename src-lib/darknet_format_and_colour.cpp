@@ -340,6 +340,10 @@ std::string Darknet::format_layer_summary(const size_t idx, const Darknet::CfgSe
 			{
 				str = std::to_string(l.groups);
 			}
+			else if (l.type == Darknet::ELayerType::CHANNEL_SLICE)
+			{
+				str.clear();
+			}
 			else if (l.groups > 1)
 			{
 				str += " / " + std::to_string(l.groups);
@@ -360,6 +364,10 @@ std::string Darknet::format_layer_summary(const size_t idx, const Darknet::CfgSe
 			{
 				ss << (i == 0 ? "#" : ", ") << l.input_layers[i];
 			}
+		}
+		else if (l.type == Darknet::ELayerType::CHANNEL_SLICE)
+		{
+			ss << "#" << l.input_layers[0] << "[" << l.channel_start << ":" << l.channel_count << "]";
 		}
 		else if (l.type == Darknet::ELayerType::YOLO)
 		{
@@ -400,6 +408,10 @@ std::string Darknet::format_layer_summary(const size_t idx, const Darknet::CfgSe
 			{
 				ss << l.group_id << "/" << l.groups;
 			}
+		}
+		else if (l.type == Darknet::ELayerType::CHANNEL_SLICE)
+		{
+			ss << l.w << " x " << l.h << " x " << l.c;
 		}
 		else if (l.type == Darknet::ELayerType::SHORTCUT)
 		{

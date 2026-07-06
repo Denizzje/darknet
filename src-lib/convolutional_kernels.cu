@@ -1503,7 +1503,8 @@ void update_convolutional_layer_gpu(Darknet::Layer & l, int batch, float learnin
 	}
 
 	// Loss scale for Mixed-Precision on Tensor-Cores
-	float learning_rate = learning_rate_init*l.learning_rate_scale / loss_scale;
+	const float learning_rate = (l.use_current_update_rates ? l.current_learning_rate : learning_rate_init*l.learning_rate_scale) / loss_scale;
+	const float bias_learning_rate = (l.use_current_update_rates ? l.current_bias_learning_rate : learning_rate_init*l.learning_rate_scale) / loss_scale;
 
 	reset_nan_and_inf(l.weight_updates_gpu, l.nweights);
 	fix_nan_and_inf(l.weights_gpu, l.nweights);
@@ -1518,7 +1519,7 @@ void update_convolutional_layer_gpu(Darknet::Layer & l, int batch, float learnin
 	{
 		adam_update_gpu(l.weights_gpu, l.weight_updates_gpu, l.m_gpu, l.v_gpu, l.B1, l.B2, l.eps, decay, learning_rate, l.nweights, batch, l.t);
 
-		adam_update_gpu(l.biases_gpu, l.bias_updates_gpu, l.bias_m_gpu, l.bias_v_gpu, l.B1, l.B2, l.eps, decay, learning_rate, l.n, batch, l.t);
+		adam_update_gpu(l.biases_gpu, l.bias_updates_gpu, l.bias_m_gpu, l.bias_v_gpu, l.B1, l.B2, l.eps, decay, bias_learning_rate, l.n, batch, l.t);
 		if (l.scales_gpu)
 		{
 			adam_update_gpu(l.scales_gpu, l.scale_updates_gpu, l.scale_m_gpu, l.scale_v_gpu, l.B1, l.B2, l.eps, decay, learning_rate, l.n, batch, l.t);
@@ -1544,7 +1545,7 @@ void update_convolutional_layer_gpu(Darknet::Layer & l, int batch, float learnin
 
 		scal_ongpu(l.nweights, momentum, l.weight_updates_gpu, 1);
 
-		axpy_ongpu(l.n, learning_rate / batch, l.bias_updates_gpu, 1, l.biases_gpu, 1);
+		axpy_ongpu(l.n, bias_learning_rate / batch, l.bias_updates_gpu, 1, l.biases_gpu, 1);
 		scal_ongpu(l.n, momentum, l.bias_updates_gpu, 1);
 
 		if (l.scales_gpu) {

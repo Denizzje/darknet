@@ -182,6 +182,8 @@ namespace Darknet
 			int *rewritten_bbox;
 
 			float learning_rate;
+			float final_learning_rate;
+			float lrf;
 			float learning_rate_min;
 			float learning_rate_max;
 			int batches_per_cycle;
@@ -201,6 +203,13 @@ namespace Darknet
 			int   *steps;
 			int num_steps;
 			int burn_in;
+			int warmup_iterations;
+			float warmup_bias_lr;
+			float warmup_momentum;
+			float warmup_nonbias_lr_start;
+			int close_mosaic_epochs;
+			int close_mosaic_iteration;
+			int close_mosaic_logged;
 			int cudnn_half;
 
 			int adam;
@@ -218,10 +227,24 @@ namespace Darknet
 			/// The number of channels for the network.  Typically @p 3 when working with RGB images.
 			int c;
 			int center;
+			int augment_policy; ///< 0 = legacy Darknet augmentation, 1 = YOLOv9 reference-policy fields.
 			int flip; ///< horizontal flip 50% probability augmentaiont for classifier training (default = 1)
 			int gaussian_noise;
 			int blur;
 			int mixup;
+			float hsv_h;
+			float hsv_s;
+			float hsv_v;
+			float degrees;
+			float translate;
+			float yolov9_scale;
+			float shear;
+			float perspective;
+			float flipud_prob;
+			float fliplr_prob;
+			float mosaic_prob;
+			float mixup_prob;
+			float copy_paste_prob;
 			float label_smooth_eps;
 			int resize_step;
 			int attention;
@@ -337,6 +360,8 @@ float get_current_seq_subdivisions(const Darknet::Network & net);
 int get_sequence_value(const Darknet::Network & net);
 
 float get_current_rate(const Darknet::Network & net);
+float get_current_bias_rate(const Darknet::Network & net);
+float get_current_momentum(const Darknet::Network & net);
 
 int get_current_batch(const Darknet::Network & net);
 

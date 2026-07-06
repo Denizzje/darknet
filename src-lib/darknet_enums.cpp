@@ -37,6 +37,7 @@ const Darknet::NamesAndLayers & Darknet::all_names_and_layers()
 		{"softmax"			, ELayerType::SOFTMAX			},
 		{"contrastive"		, ELayerType::CONTRASTIVE		},
 		{"route"			, ELayerType::ROUTE				},
+		{"channel_slice"	, ELayerType::CHANNEL_SLICE		},
 		{"upsample"			, ELayerType::UPSAMPLE			},
 		{"empty"			, ELayerType::EMPTY				},
 		{"silence"			, ELayerType::EMPTY				},
@@ -161,6 +162,7 @@ const Darknet::NamesAndLearningRatePolicies & Darknet::all_names_and_learning_ra
 		{"sigmoid"	, ELearningRatePolicy::SIG		},
 		{"steps"	, ELearningRatePolicy::STEPS	},
 		{"sgdr"		, ELearningRatePolicy::SGDR		},
+		{"linear_final", ELearningRatePolicy::LINEAR_FINAL},
 	};
 
 	return m;

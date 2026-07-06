@@ -917,146 +917,158 @@ void train_yolov9_single_branch_gpu(Darknet::Layer & l, Darknet::NetworkState st
 	float *max_metric_by_truth = top_overlaps + top_count;
 	float *max_overlap_by_truth = max_metric_by_truth + gt_slots;
 	float *loss_stats = max_overlap_by_truth + gt_slots;
+	float total_loss = 0.0f;
 
-	for (int scale = 0; scale < l.n; ++scale)
+	for (int slot = 0; slot < l.total; ++slot)
 	{
-		fill_ongpu(l.input_sizes[scale] * batch, 0.0f, state.net.layers[l.input_layers[scale]].delta_gpu, 1);
+		fill_ongpu(l.input_sizes[slot] * batch, 0.0f, state.net.layers[l.input_layers[slot]].delta_gpu, 1);
 	}
 	fill_ongpu(l.outputs * batch, 0.0f, l.delta_gpu, 1);
-	fill_ongpu(class_count, 0.0f, target_scores, 1);
-	fill_ongpu(point_count, -1.0f, assignment_gt, 1);
-	fill_ongpu(point_count, 0.0f, assignment_overlap, 1);
-	fill_ongpu(point_count, 0.0f, assignment_metric, 1);
-	fill_ongpu(gt_slots, 0.0f, max_metric_by_truth, 1);
-	fill_ongpu(gt_slots, 0.0f, max_overlap_by_truth, 1);
-	fill_ongpu(8, 0.0f, loss_stats, 1);
 
-	yolov9_decode_predictions_kernel<<<cuda_gridsize(point_count), BLOCK, 0, get_cuda_stream()>>>(
-		point_count,
-		total_points,
-		l.classes,
-		l.reg_max,
-		l.n,
-		l.layers_output_gpu,
-		l.input_sizes_gpu,
-		pred_boxes,
-		pred_scores);
-	CHECK_CUDA(cudaPeekAtLastError());
+	for (int branch = 0; branch < l.branch_count; ++branch)
+	{
+		const int branch_offset = branch * l.n;
+		const float branch_weight = (branch == l.inference_branch) ? 1.0f : l.aux_loss_weight;
+		float **branch_outputs = l.layers_output_gpu + branch_offset;
+		float **branch_deltas = l.layers_delta_gpu + branch_offset;
+		int *branch_meta = l.input_sizes_gpu + branch_offset * YOLOV9_META_STRIDE;
 
-	yolov9_topk_kernel<<<cuda_gridsize(gt_slots), BLOCK, 0, get_cuda_stream()>>>(
-		gt_slots,
-		total_points,
-		l.classes,
-		l.max_boxes,
-		l.truth_size,
-		l.truths,
-		state.net.w,
-		state.net.h,
-		topk,
-		l.tal_alpha,
-		l.tal_beta,
-		l.n,
-		l.input_sizes_gpu,
-		state.truth,
-		pred_boxes,
-		pred_scores,
-		top_indices,
-		top_metrics,
-		top_overlaps);
-	CHECK_CUDA(cudaPeekAtLastError());
+		fill_ongpu(class_count, 0.0f, target_scores, 1);
+		fill_ongpu(point_count, -1.0f, assignment_gt, 1);
+		fill_ongpu(point_count, 0.0f, assignment_overlap, 1);
+		fill_ongpu(point_count, 0.0f, assignment_metric, 1);
+		fill_ongpu(gt_slots, 0.0f, max_metric_by_truth, 1);
+		fill_ongpu(gt_slots, 0.0f, max_overlap_by_truth, 1);
+		fill_ongpu(8, 0.0f, loss_stats, 1);
 
-	yolov9_resolve_overlap_batched_kernel<<<cuda_gridsize(top_count), BLOCK, 0, get_cuda_stream()>>>(
-		top_count,
-		total_points,
-		l.max_boxes,
-		topk,
-		top_indices,
-		top_overlaps,
-		assignment_overlap);
-	CHECK_CUDA(cudaPeekAtLastError());
+		yolov9_decode_predictions_kernel<<<cuda_gridsize(point_count), BLOCK, 0, get_cuda_stream()>>>(
+			point_count,
+			total_points,
+			l.classes,
+			l.reg_max,
+			l.n,
+			branch_outputs,
+			branch_meta,
+			pred_boxes,
+			pred_scores);
+		CHECK_CUDA(cudaPeekAtLastError());
 
-	yolov9_write_assignments_kernel<<<cuda_gridsize(top_count), BLOCK, 0, get_cuda_stream()>>>(
-		top_count,
-		total_points,
-		l.max_boxes,
-		topk,
-		top_indices,
-		top_metrics,
-		top_overlaps,
-		assignment_gt,
-		assignment_metric,
-		assignment_overlap);
-	CHECK_CUDA(cudaPeekAtLastError());
+		yolov9_topk_kernel<<<cuda_gridsize(gt_slots), BLOCK, 0, get_cuda_stream()>>>(
+			gt_slots,
+			total_points,
+			l.classes,
+			l.max_boxes,
+			l.truth_size,
+			l.truths,
+			state.net.w,
+			state.net.h,
+			topk,
+			l.tal_alpha,
+			l.tal_beta,
+			l.n,
+			branch_meta,
+			state.truth,
+			pred_boxes,
+			pred_scores,
+			top_indices,
+			top_metrics,
+			top_overlaps);
+		CHECK_CUDA(cudaPeekAtLastError());
 
-	yolov9_truth_max_kernel<<<cuda_gridsize(top_count), BLOCK, 0, get_cuda_stream()>>>(
-		top_count,
-		total_points,
-		l.max_boxes,
-		topk,
-		top_indices,
-		top_metrics,
-		top_overlaps,
-		assignment_gt,
-		max_metric_by_truth,
-		max_overlap_by_truth);
-	CHECK_CUDA(cudaPeekAtLastError());
+		yolov9_resolve_overlap_batched_kernel<<<cuda_gridsize(top_count), BLOCK, 0, get_cuda_stream()>>>(
+			top_count,
+			total_points,
+			l.max_boxes,
+			topk,
+			top_indices,
+			top_overlaps,
+			assignment_overlap);
+		CHECK_CUDA(cudaPeekAtLastError());
 
-	yolov9_target_scores_kernel<<<cuda_gridsize(point_count), BLOCK, 0, get_cuda_stream()>>>(
-		point_count,
-		total_points,
-		l.classes,
-		l.max_boxes,
-		l.truth_size,
-		l.truths,
-		state.truth,
-		assignment_gt,
-		assignment_metric,
-		max_metric_by_truth,
-		max_overlap_by_truth,
-		target_scores,
-		loss_stats);
-	CHECK_CUDA(cudaPeekAtLastError());
+		yolov9_write_assignments_kernel<<<cuda_gridsize(top_count), BLOCK, 0, get_cuda_stream()>>>(
+			top_count,
+			total_points,
+			l.max_boxes,
+			topk,
+			top_indices,
+			top_metrics,
+			top_overlaps,
+			assignment_gt,
+			assignment_metric,
+			assignment_overlap);
+		CHECK_CUDA(cudaPeekAtLastError());
 
-	yolov9_class_loss_delta_kernel<<<cuda_gridsize(class_count), BLOCK, 0, get_cuda_stream()>>>(
-		class_count,
-		total_points,
-		l.classes,
-		l.reg_max,
-		l.n,
-		l.cls_normalizer,
-		state.net.loss_scale,
-		l.layers_output_gpu,
-		l.layers_delta_gpu,
-		l.input_sizes_gpu,
-		pred_scores,
-		target_scores,
-		loss_stats);
-	CHECK_CUDA(cudaPeekAtLastError());
+		yolov9_truth_max_kernel<<<cuda_gridsize(top_count), BLOCK, 0, get_cuda_stream()>>>(
+			top_count,
+			total_points,
+			l.max_boxes,
+			topk,
+			top_indices,
+			top_metrics,
+			top_overlaps,
+			assignment_gt,
+			max_metric_by_truth,
+			max_overlap_by_truth);
+		CHECK_CUDA(cudaPeekAtLastError());
 
-	yolov9_box_dfl_loss_delta_kernel<<<cuda_gridsize(point_count), BLOCK, 0, get_cuda_stream()>>>(
-		point_count,
-		total_points,
-		l.classes,
-		l.reg_max,
-		l.max_boxes,
-		l.truth_size,
-		l.truths,
-		state.net.w,
-		state.net.h,
-		l.n,
-		l.box_normalizer,
-		l.dfl_normalizer,
-		state.net.loss_scale,
-		l.layers_output_gpu,
-		l.layers_delta_gpu,
-		l.input_sizes_gpu,
-		state.truth,
-		assignment_gt,
-		target_scores,
-		loss_stats);
-	CHECK_CUDA(cudaPeekAtLastError());
+		yolov9_target_scores_kernel<<<cuda_gridsize(point_count), BLOCK, 0, get_cuda_stream()>>>(
+			point_count,
+			total_points,
+			l.classes,
+			l.max_boxes,
+			l.truth_size,
+			l.truths,
+			state.truth,
+			assignment_gt,
+			assignment_metric,
+			max_metric_by_truth,
+			max_overlap_by_truth,
+			target_scores,
+			loss_stats);
+		CHECK_CUDA(cudaPeekAtLastError());
 
-	float loss_cpu[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-	cuda_pull_array(loss_stats, loss_cpu, 5);
-	l.cost[0] = loss_cpu[2] + loss_cpu[3] + loss_cpu[4];
+		yolov9_class_loss_delta_kernel<<<cuda_gridsize(class_count), BLOCK, 0, get_cuda_stream()>>>(
+			class_count,
+			total_points,
+			l.classes,
+			l.reg_max,
+			l.n,
+			branch_weight * l.cls_normalizer,
+			state.net.loss_scale,
+			branch_outputs,
+			branch_deltas,
+			branch_meta,
+			pred_scores,
+			target_scores,
+			loss_stats);
+		CHECK_CUDA(cudaPeekAtLastError());
+
+		yolov9_box_dfl_loss_delta_kernel<<<cuda_gridsize(point_count), BLOCK, 0, get_cuda_stream()>>>(
+			point_count,
+			total_points,
+			l.classes,
+			l.reg_max,
+			l.max_boxes,
+			l.truth_size,
+			l.truths,
+			state.net.w,
+			state.net.h,
+			l.n,
+			branch_weight * l.box_normalizer,
+			branch_weight * l.dfl_normalizer,
+			state.net.loss_scale,
+			branch_outputs,
+			branch_deltas,
+			branch_meta,
+			state.truth,
+			assignment_gt,
+			target_scores,
+			loss_stats);
+		CHECK_CUDA(cudaPeekAtLastError());
+
+		float loss_cpu[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+		cuda_pull_array(loss_stats, loss_cpu, 5);
+		total_loss += loss_cpu[2] + loss_cpu[3] + loss_cpu[4];
+	}
+	l.cost[0] = total_loss;
 }

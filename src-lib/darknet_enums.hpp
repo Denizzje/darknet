@@ -31,6 +31,7 @@ namespace Darknet
 		SOFTMAX										,	///< used in several non-YOLO configs
 		DROPOUT										,	///< used in 3 non-YOLO configs
 		ROUTE										,	///< used often
+		CHANNEL_SLICE								,	///< used by YOLOv9 CBLinear lowering
 		COST										,	///< used in several non-YOLO configs
 		AVGPOOL										,	///< used in several non-YOLO configs
 		SHORTCUT									,	///< used almost everywhere
@@ -115,6 +116,7 @@ namespace Darknet
 		SIG			= learning_rate_policy::SIG		,
 		RANDOM		= learning_rate_policy::RANDOM	,
 		SGDR		= learning_rate_policy::SGDR	,
+		LINEAR_FINAL= learning_rate_policy::LINEAR_FINAL,
 	};
 
 	/// @{ Convert between names and learning rate policies.

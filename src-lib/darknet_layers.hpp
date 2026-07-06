@@ -58,6 +58,8 @@ namespace Darknet
 		int truth_size;
 		int groups;
 		int group_id;
+		int channel_start;
+		int channel_count;
 		int size;
 		int side;
 		int stride;
@@ -118,6 +120,9 @@ namespace Darknet
 		float shift;
 		float ratio;
 		float learning_rate_scale;
+		int use_current_update_rates;
+		float current_learning_rate;
+		float current_bias_learning_rate;
 		float clip;
 		int focal_loss;
 		float *classes_multipliers;
@@ -536,6 +541,7 @@ namespace Darknet
 
 #include "avgpool_layer.hpp"
 #include "batchnorm_layer.hpp"
+#include "channel_slice_layer.hpp"
 #include "connected_layer.hpp"
 #include "convolutional_layer.hpp"
 #include "cost_layer.hpp"
